@@ -108,10 +108,11 @@ class KernelBuilder:
         for engine, slot in slots:
             reads, writes = self._analyze_dependencies(engine, slot)
             
-            # Check: slot available AND no Read-After-Write hazard
+            # Check: slot available AND no Read-After-Write hazard AND no Write-After-Write hazard
             can_add = (
                 slot_counts[engine] < SLOT_LIMITS[engine] and
-                not (reads & written_this_cycle)
+                not (reads & written_this_cycle) and
+                not (writes & written_this_cycle)  # Prevent WAW hazards
             )
             
             if not can_add:
@@ -260,16 +261,11 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
-
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
-
-        self.add("flow", ("pause",))
-        self.add("debug", ("comment", "Starting loop"))
+        
+        # Pre-allocate constants
+        zero_const = self.alloc_scratch("zero_const")
+        one_const = self.alloc_scratch("one_const")
+        two_const = self.alloc_scratch("two_const")
 
         body = []  # array of slots
 
@@ -301,12 +297,52 @@ class KernelBuilder:
         for u in range(VEC_UNROLL):
             addr_tmp.append([self.alloc_scratch(f"addr{u}_{vi}") for vi in range(VLEN)])
         
-        # Pre-allocate constants for hash operations
-        hash_constants = []
+        # Pre-allocate all offset constants
+        offset_const_addrs = []
+        for vec_i in range(vec_batch_size):
+            i = vec_i * VLEN
+            addr = self.alloc_scratch(f"offset_const_{vec_i}")
+            offset_const_addrs.append(addr)
+        
+        # Pre-allocate constants for hash operations - allocate addresses only
+        hash_const_addrs = []
         for op1, val1, op2, op3, val3 in HASH_STAGES:
-            const1 = self.scratch_const(val1)
-            const2 = self.scratch_const(val3)
-            hash_constants.append((op1, const1, op2, op3, const2))
+            const1_addr = self.alloc_scratch(f"hash_const1_{len(hash_const_addrs)}")
+            const2_addr = self.alloc_scratch(f"hash_const2_{len(hash_const_addrs)}")
+            hash_const_addrs.append((op1, const1_addr, val1, op2, op3, const2_addr, val3))
+        
+        # Build init sequence with VLIW packing
+        init_body = []
+        for i, v in enumerate(init_vars):
+            init_body.append(("load", ("const", tmp1, i)))
+            init_body.append(("load", ("load", self.scratch[v], tmp1)))
+        
+        # Load all constants
+        init_body.append(("load", ("const", zero_const, 0)))
+        init_body.append(("load", ("const", one_const, 1)))
+        init_body.append(("load", ("const", two_const, 2)))
+        
+        # Load offset constants
+        for vec_i, addr in enumerate(offset_const_addrs):
+            i = vec_i * VLEN
+            init_body.append(("load", ("const", addr, i)))
+        
+        # Load hash constants
+        for op1, const1_addr, val1, op2, op3, const2_addr, val3 in hash_const_addrs:
+            init_body.append(("load", ("const", const1_addr, val1)))
+            init_body.append(("load", ("const", const2_addr, val3)))
+        
+        # Pack and add init instructions
+        init_instrs = self.build(init_body, vliw=True)
+        self.instrs.extend(init_instrs)
+        self.add("flow", ("pause",))
+        
+        # Build hash_constants list using allocated addresses
+        hash_constants = []
+        for op1, const1_addr, val1, op2, op3, const2_addr, val3 in hash_const_addrs:
+            hash_constants.append((op1, const1_addr, op2, op3, const2_addr))
+        
+        body = []  # array of slots
         
         # Pre-broadcast common constants outside the loop
         body.append(("valu", ("vbroadcast", v_two, two_const)))
@@ -320,8 +356,7 @@ class KernelBuilder:
                 # Stage 1: Load indices and values for all unrolled vectors
                 for u in range(num_vec_unrolled):
                     vec_i = vec_i_base + u
-                    i = vec_i * VLEN
-                    i_const = self.scratch_const(i)
+                    i_const = offset_const_addrs[vec_i]
                     vr = v_regs[u]
                     at = addr_tmp[u][0]  # Use first address temp for vector loads
                     
@@ -333,8 +368,7 @@ class KernelBuilder:
                 
                 for u in range(num_vec_unrolled):
                     vec_i = vec_i_base + u
-                    i = vec_i * VLEN
-                    i_const = self.scratch_const(i)
+                    i_const = offset_const_addrs[vec_i]
                     vr = v_regs[u]
                     at = addr_tmp[u][0]
                     body.append(("alu", ("+", at, self.scratch["inp_values_p"], i_const)))
@@ -342,20 +376,6 @@ class KernelBuilder:
                     vr = v_regs[u]
                     at = addr_tmp[u][0]
                     body.append(("load", ("vload", vr['val'], at)))
-                
-                # Debug loaded values
-                for u in range(num_vec_unrolled):
-                    vec_i = vec_i_base + u
-                    i = vec_i * VLEN
-                    vr = v_regs[u]
-                    for vi in range(VLEN):
-                        body.append(("debug", ("compare", vr['idx'] + vi, (round, i + vi, "idx"))))
-                for u in range(num_vec_unrolled):
-                    vec_i = vec_i_base + u
-                    i = vec_i * VLEN
-                    vr = v_regs[u]
-                    for vi in range(VLEN):
-                        body.append(("debug", ("compare", vr['val'] + vi, (round, i + vi, "val"))))
                 
                 # Stage 2: Load node values (scalar loads - batch all address calculations, then all loads)
                 # Calculate ALL addresses first (use dedicated address temps for each element)
@@ -370,14 +390,6 @@ class KernelBuilder:
                     for vi in range(VLEN):
                         at = addr_tmp[u][vi]
                         body.append(("load", ("load", vr['node_val'] + vi, at)))
-                
-                # Debug node values
-                for u in range(num_vec_unrolled):
-                    vec_i = vec_i_base + u
-                    i = vec_i * VLEN
-                    vr = v_regs[u]
-                    for vi in range(VLEN):
-                        body.append(("debug", ("compare", vr['node_val'] + vi, (round, i + vi, "node_val"))))
                 
                 # Stage 3: XOR (vectorized for all unrolled iterations)
                 for u in range(num_vec_unrolled):
@@ -397,21 +409,6 @@ class KernelBuilder:
                     for u in range(num_vec_unrolled):
                         vr = v_regs[u]
                         body.append(("valu", (op2, vr['val'], vr['tmp1'], vr['tmp2'])))
-                    # Debug each hash stage
-                    for u in range(num_vec_unrolled):
-                        vec_i = vec_i_base + u
-                        i = vec_i * VLEN
-                        vr = v_regs[u]
-                        for vi in range(VLEN):
-                            body.append(("debug", ("compare", vr['val'] + vi, (round, i + vi, "hash_stage", hi))))
-                
-                # Debug hashed values
-                for u in range(num_vec_unrolled):
-                    vec_i = vec_i_base + u
-                    i = vec_i * VLEN
-                    vr = v_regs[u]
-                    for vi in range(VLEN):
-                        body.append(("debug", ("compare", vr['val'] + vi, (round, i + vi, "hashed_val"))))
                 
                 # Stage 5: Index updates (vectorized for all unrolled iterations)
                 for u in range(num_vec_unrolled):
@@ -430,14 +427,6 @@ class KernelBuilder:
                     vr = v_regs[u]
                     body.append(("valu", ("+", vr['idx'], vr['idx'], vr['tmp3'])))
                 
-                # Debug next_idx
-                for u in range(num_vec_unrolled):
-                    vec_i = vec_i_base + u
-                    i = vec_i * VLEN
-                    vr = v_regs[u]
-                    for vi in range(VLEN):
-                        body.append(("debug", ("compare", vr['idx'] + vi, (round, i + vi, "next_idx"))))
-                
                 # Stage 6: Bounds checking (vectorized for all unrolled iterations)
                 for u in range(num_vec_unrolled):
                     vr = v_regs[u]
@@ -446,19 +435,10 @@ class KernelBuilder:
                     vr = v_regs[u]
                     body.append(("valu", ("*", vr['idx'], vr['tmp1'], vr['idx'])))
                 
-                # Debug wrapped_idx
-                for u in range(num_vec_unrolled):
-                    vec_i = vec_i_base + u
-                    i = vec_i * VLEN
-                    vr = v_regs[u]
-                    for vi in range(VLEN):
-                        body.append(("debug", ("compare", vr['idx'] + vi, (round, i + vi, "wrapped_idx"))))
-                
                 # Stage 7: Store results (vectorized for all unrolled iterations)
                 for u in range(num_vec_unrolled):
                     vec_i = vec_i_base + u
-                    i = vec_i * VLEN
-                    i_const = self.scratch_const(i)
+                    i_const = offset_const_addrs[vec_i]
                     vr = v_regs[u]
                     at = addr_tmp[u][0]
                     body.append(("alu", ("+", at, self.scratch["inp_indices_p"], i_const)))
@@ -469,8 +449,7 @@ class KernelBuilder:
                 
                 for u in range(num_vec_unrolled):
                     vec_i = vec_i_base + u
-                    i = vec_i * VLEN
-                    i_const = self.scratch_const(i)
+                    i_const = offset_const_addrs[vec_i]
                     vr = v_regs[u]
                     at = addr_tmp[u][0]
                     body.append(("alu", ("+", at, self.scratch["inp_values_p"], i_const)))
