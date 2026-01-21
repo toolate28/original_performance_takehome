@@ -179,9 +179,8 @@ class KernelBuilder:
         5. Pre-compute and cache hash constants
         6. Batch all constant loads together for maximum VLIW packing
         """
-        # Max unroll with scratch space constraint
-        # With 8 regs/iter and ~300 for constants/other: (1536-300)/8 ≈ 154
-        UNROLL_FACTOR = min(154, batch_size)
+        # Smaller unroll factor for better packing - matches ALU slot limit
+        UNROLL_FACTOR = 12
         
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
