@@ -45,6 +45,49 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
+    def _analyze_dependencies(self, engine: str, slot: tuple):
+        """Extract read/write scratch addresses for dependency analysis"""
+        reads = set()
+        writes = set()
+        
+        if engine == "alu":
+            op, dest, src1, src2 = slot
+            writes.add(dest)
+            reads.update([src1, src2])
+        elif engine == "load":
+            if slot[0] in ["load", "load_offset"]:
+                writes.add(slot[1])
+                if len(slot) > 2:
+                    reads.add(slot[2])
+            elif slot[0] == "const":
+                writes.add(slot[1])
+            elif slot[0] == "vload":
+                for i in range(8):  # VLEN=8
+                    writes.add(slot[1] + i)
+                reads.add(slot[2])
+        elif engine == "store":
+            if slot[0] == "store":
+                reads.update([slot[1], slot[2]])
+            elif slot[0] == "vstore":
+                reads.add(slot[1])
+                for i in range(8):
+                    reads.add(slot[2] + i)
+        elif engine == "flow":
+            if slot[0] == "select":
+                _, dest, cond, a, b = slot
+                writes.add(dest)
+                reads.update([cond, a, b])
+            elif slot[0] in ["cond_jump", "cond_jump_rel"]:
+                reads.add(slot[1])
+            elif slot[0] == "add_imm":
+                writes.add(slot[1])
+                reads.add(slot[2])
+        elif engine == "debug":
+            if slot[0] == "compare":
+                reads.add(slot[1])
+        
+        return reads, writes
+
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
         """
         VLIW packing with dependency-aware scheduling.
