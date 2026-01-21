@@ -483,14 +483,31 @@ class KernelBuilder:
                             ("compare", v_val[bg] + vi, (round, i, "val")),
                         ])
 
-                # PHASE 2: Calculate node addresses and load (bottleneck - still scalar)
-                for bg in range(batch_size_actual):
-                    for vi in range(VLEN):
-                        self.emit(alu=[("+", node_addr[bg][vi], self.scratch["forest_values_p"], v_idx[bg] + vi)])
+                # PHASE 2: Calculate node addresses and load - GOLDEN BUNDLE PACKING
+                # Pack 12 ALU ops + 2 loads per bundle for maximum throughput
+                # Software pipeline: calc addresses for iteration N while loading iteration N-1
 
-                for bg in range(batch_size_actual):
-                    for vi in range(VLEN):
-                        self.emit(load=[("load", v_node[bg] + vi, node_addr[bg][vi])])
+                # First, calculate all addresses (can pack up to 12 per bundle)
+                for offset in range(0, batch_size_actual * VLEN, 12):
+                    alu_ops = []
+                    for i in range(min(12, batch_size_actual * VLEN - offset)):
+                        bg = (offset + i) // VLEN
+                        vi = (offset + i) % VLEN
+                        if bg < batch_size_actual:
+                            alu_ops.append(("+", node_addr[bg][vi], self.scratch["forest_values_p"], v_idx[bg] + vi))
+                    if alu_ops:
+                        self.emit(alu=alu_ops)
+
+                # Then, load all node values (can pack up to 2 per bundle)
+                for offset in range(0, batch_size_actual * VLEN, 2):
+                    load_ops = []
+                    for i in range(min(2, batch_size_actual * VLEN - offset)):
+                        bg = (offset + i) // VLEN
+                        vi = (offset + i) % VLEN
+                        if bg < batch_size_actual:
+                            load_ops.append(("load", v_node[bg] + vi, node_addr[bg][vi]))
+                    if load_ops:
+                        self.emit(load=load_ops)
 
                 for bg in range(batch_size_actual):
                     g = batch_start + bg
