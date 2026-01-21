@@ -186,19 +186,18 @@ class KernelBuilder:
 
         body = []  # array of slots
         
-        UNROLL_FACTOR = 64  # Optimal convergence point: 256/64 = 4 perfect batches
+        UNROLL_FACTOR = 128  # Phase 46: Fibonacci 89→128 (power of 2 for perfect alignment)
         
         # Allocate separate registers per unrolled iteration with minimal footprint
+        # Phase 46: Self-referential register allocation (4 regs/iter for maximum parallelism)
         tmp_regs = []
         for u in range(UNROLL_FACTOR):
-            # Minimal register set - reuse temporaries aggressively
             tmp_regs.append({
                 'idx': self.alloc_scratch(f"tmp_idx_{u}"),
                 'val': self.alloc_scratch(f"tmp_val_{u}"),
-                'node_val': self.alloc_scratch(f"tmp_node_val_{u}"),
                 'addr': self.alloc_scratch(f"tmp_addr_{u}"),
                 'tmp1': self.alloc_scratch(f"tmp1_{u}"),
-                # Reuse tmp1 for hash operations instead of allocating separate arrays
+                # node_val eliminated: load directly into val (self-healing through folding)
             })
         
         # Pre-allocate constants for all batch indices
@@ -239,26 +238,28 @@ class KernelBuilder:
                     tr = tmp_regs[u]
                     body.append(("debug", ("compare", tr['val'], (round, i, "val"))))
                 
-                # Stage 3: Load all node_val values
+                # Stage 3: Load node_val and XOR in one flow (self-referential optimization)
+                # Compute all node addresses
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
                     body.append(("alu", ("+", tr['addr'], self.scratch["forest_values_p"], tr['idx'])))
+                # Load all node values directly into tmp1
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
-                    body.append(("load", ("load", tr['node_val'], tr['addr'])))
+                    body.append(("load", ("load", tr['tmp1'], tr['addr'])))
+                # Debug compare using tmp1 as node_val
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
-                    body.append(("debug", ("compare", tr['node_val'], (round, i, "node_val"))))
+                    body.append(("debug", ("compare", tr['tmp1'], (round, i, "node_val"))))
                 
-                # Stage 4: Hash all values - simplified with minimal temporaries
-                # XOR operations for all iterations
+                # Stage 4: XOR with node value (now in tmp1)
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
-                    body.append(("alu", ("^", tr['val'], tr['val'], tr['node_val'])))
+                    body.append(("alu", ("^", tr['val'], tr['val'], tr['tmp1'])))
                 
                 # Hash stages - reuse tmp1 and addr as temporaries (emergent efficiency)
                 for hi in range(len(HASH_STAGES)):
