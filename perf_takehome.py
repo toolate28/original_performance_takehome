@@ -186,9 +186,7 @@ class KernelBuilder:
 
         body = []  # array of slots
         
-        UNROLL_FACTOR = 144  # φ^21: Maximum Fibonacci compression before explosion
-        
-        UNROLL_FACTOR = 16  # φ-chaos minimum: 20,759 cycles through recursive Fibonacci injection
+        UNROLL_FACTOR = 16  # Empirically optimal (20,759 cycles baseline)
         
         # Allocate separate registers per unrolled iteration with minimal footprint
         tmp_regs = []
@@ -200,8 +198,23 @@ class KernelBuilder:
                 'tmp1': self.alloc_scratch(f"tmp1_{u}"),
             })
         
-        # Pre-allocate constants for all batch indices
-        i_const_addrs = [self.scratch_const(i) for i in range(batch_size)]
+        # PRE-ALLOCATE ALL CONSTANTS (Hawking radiation attenuation)
+        # Generate constants for: batch indices, special values, hash constants
+        zero_const = self.scratch_const(0, "const_zero")
+        one_const = self.scratch_const(1, "const_one")
+        two_const = self.scratch_const(2, "const_two")
+        
+        # Pre-allocate batch index constants (0-255)
+        i_const_addrs = [self.scratch_const(i, f"const_i{i}") for i in range(batch_size)]
+        
+        # Pre-allocate hash stage constants
+        from problem import HASH_STAGES
+        hash_const_addrs = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            hash_const_addrs.append({
+                'val1': self.scratch_const(val1, f"hash_{hi}_val1"),
+                'val3': self.scratch_const(val3, f"hash_{hi}_val3"),
+            })
         
         # Pure stability iteration: optimal substrate balance
         for round in range(rounds):
@@ -264,22 +277,23 @@ class KernelBuilder:
                     tr = tmp_regs[u]
                     body.append(("alu", ("^", tr['val'], tr['val'], tr['tmp1'])))
                 
-                # APERIODIC PHASE 5: Hash operations with stage-preserving interleaving
+                # APERIODIC PHASE 5: Hash operations with pre-allocated constants
                 # Maintain stage order for correctness but maximize iteration parallelism
                 for hi in range(len(HASH_STAGES)):
                     op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                    hash_consts = hash_const_addrs[hi]
                     
-                    # All op1 operations for this stage
+                    # All op1 operations for this stage (use pre-allocated constant)
                     for u in range(num_iters):
                         i = i_base + u
                         tr = tmp_regs[u]
-                        body.append(("alu", (op1, tr['tmp1'], tr['val'], self.scratch_const(val1))))
+                        body.append(("alu", (op1, tr['tmp1'], tr['val'], hash_consts['val1'])))
                     
-                    # All op3 operations for this stage
+                    # All op3 operations for this stage (use pre-allocated constant)
                     for u in range(num_iters):
                         i = i_base + u
                         tr = tmp_regs[u]
-                        body.append(("alu", (op3, tr['addr'], tr['val'], self.scratch_const(val3))))
+                        body.append(("alu", (op3, tr['addr'], tr['val'], hash_consts['val3'])))
                     
                     # All op2 operations for this stage
                     for u in range(num_iters):
