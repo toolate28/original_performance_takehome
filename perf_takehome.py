@@ -186,7 +186,7 @@ class KernelBuilder:
 
         body = []  # array of slots
         
-        UNROLL_FACTOR = 13  # Fibonacci golden resonance
+        UNROLL_FACTOR = 55  # Fibonacci golden resonance - higher parallelism
         
         # Allocate separate registers per unrolled iteration (eliminate RAW hazards)
         tmp_regs = []
@@ -336,7 +336,8 @@ class KernelBuilder:
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
-                    body.append(("flow", ("select", tr['idx'], tr['tmp1'], tr['idx'], zero_const)))
+                    # Flow→ALU: idx = tmp1 ? idx : 0  =>  idx = idx * tmp1
+                    body.append(("alu", ("*", tr['idx'], tr['idx'], tr['tmp1'])))
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
