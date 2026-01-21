@@ -193,25 +193,32 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
+    def build_hash_stage_parallel(self, unroll_regs, num_unrolled, round, i_base, stage_idx):
         """
-        Optimized hash with parallel computation.
-        Groups similar operations for better VLIW packing.
-        Reuses tmp1 and tmp2 to save scratch space.
+        Build hash operations for a specific stage across all unrolled iterations.
+        This enables better VLIW packing by grouping similar operations.
         """
         slots = []
+        op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
+        const1 = self.scratch_const(val1)
+        const2 = self.scratch_const(val3)
         
-        # Process all hash stages with maximum parallelism
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            const1 = self.scratch_const(val1)
-            const2 = self.scratch_const(val3)
-            
-            # Both operations can execute in parallel (no dependency)
-            slots.append(("alu", (op1, tmp1, val_hash_addr, const1)))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, const2)))
-            # Combine results (depends on previous two)
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+        # First operation for all iterations (can execute in parallel)
+        for u in range(num_unrolled):
+            ur = unroll_regs[u]
+            slots.append(("alu", (op1, ur['tmp1'], ur['val'], const1)))
+        
+        # Second operation for all iterations (can execute in parallel)
+        for u in range(num_unrolled):
+            ur = unroll_regs[u]
+            slots.append(("alu", (op3, ur['tmp2'], ur['val'], const2)))
+        
+        # Combine results for all iterations (depends on previous operations)
+        for u in range(num_unrolled):
+            i = i_base + u
+            ur = unroll_regs[u]
+            slots.append(("alu", (op2, ur['val'], ur['tmp1'], ur['tmp2'])))
+            slots.append(("debug", ("compare", ur['val'], (round, i, "hash_stage", stage_idx))))
         
         return slots
 
@@ -269,76 +276,112 @@ class KernelBuilder:
             for i_base in range(0, batch_size, UNROLL_FACTOR):
                 num_unrolled = min(UNROLL_FACTOR, batch_size - i_base)
                 
-                # Stage 1: Load indices (parallel)
+                # Stage 1: All address calculations + loads for indices
+                # Address calculations first (all parallel ALU ops)
                 for u in range(num_unrolled):
                     i = i_base + u
                     i_const = self.scratch_const(i)
                     ur = unroll_regs[u]
                     body.append(("alu", ("+", ur['addr'], self.scratch["inp_indices_p"], i_const)))
+                # Then loads (2 load slots, but all can be queued)
+                for u in range(num_unrolled):
+                    ur = unroll_regs[u]
                     body.append(("load", ("load", ur['idx'], ur['addr'])))
+                # Debug
+                for u in range(num_unrolled):
+                    i = i_base + u
+                    ur = unroll_regs[u]
                     body.append(("debug", ("compare", ur['idx'], (round, i, "idx"))))
                 
-                # Stage 2: Load values (parallel)
+                # Stage 2: Address calculations + loads for values (parallel with Stage 1 addresses)
                 for u in range(num_unrolled):
                     i = i_base + u
                     i_const = self.scratch_const(i)
                     ur = unroll_regs[u]
-                    body.append(("alu", ("+", ur['addr'], self.scratch["inp_values_p"], i_const)))
-                    body.append(("load", ("load", ur['val'], ur['addr'])))
-                    body.append(("debug", ("compare", ur['val'], (round, i, "val"))))
-                
-                # Stage 3: Load node values (depends on Stage 1)
+                    body.append(("alu", ("+", ur['tmp3'], self.scratch["inp_values_p"], i_const)))
+                for u in range(num_unrolled):
+                    ur = unroll_regs[u]
+                    body.append(("load", ("load", ur['val'], ur['tmp3'])))
                 for u in range(num_unrolled):
                     i = i_base + u
                     ur = unroll_regs[u]
-                    body.append(("alu", ("+", ur['addr'], self.scratch["forest_values_p"], ur['idx'])))
-                    body.append(("load", ("load", ur['node_val'], ur['addr'])))
-                    body.append(("debug", ("compare", ur['node_val'], (round, i, "node_val"))))
+                    body.append(("debug", ("compare", ur['val'], (round, i, "val"))))
                 
-                # Stage 4: XOR operations (parallel after Stage 2&3)
+                # Stage 3: Address calculations + loads for node values (depends on idx loads)
+                for u in range(num_unrolled):
+                    ur = unroll_regs[u]
+                    body.append(("alu", ("+", ur['addr'], self.scratch["forest_values_p"], ur['idx'])))
+                for u in range(num_unrolled):
+                    ur = unroll_regs[u]
+                    body.append(("load", ("load", ur['node_val'], ur['addr'])))
                 for u in range(num_unrolled):
                     i = i_base + u
+                    ur = unroll_regs[u]
+                    body.append(("debug", ("compare", ur['node_val'], (round, i, "node_val"))))
+                
+                # Stage 4: All XOR operations (12 ALU slots available)
+                for u in range(num_unrolled):
                     ur = unroll_regs[u]
                     body.append(("alu", ("^", ur['val'], ur['val'], ur['node_val'])))
                 
-                # Stage 5: Hash operations (parallel)
+                # Stage 5: Hash operations - parallel across iterations
+                for hi in range(len(HASH_STAGES)):
+                    body.extend(self.build_hash_stage_parallel(unroll_regs, num_unrolled, round, i_base, hi))
+                
                 for u in range(num_unrolled):
                     i = i_base + u
                     ur = unroll_regs[u]
-                    body.extend(self.build_hash(ur['val'], ur['tmp1'], ur['tmp2'], round, i))
                     body.append(("debug", ("compare", ur['val'], (round, i, "hashed_val"))))
                 
-                # Stage 6: Index update with flow elimination
+                # Stage 6: Index updates - all operations parallel within each step
+                for u in range(num_unrolled):
+                    ur = unroll_regs[u]
+                    body.append(("alu", ("%", ur['tmp1'], ur['val'], two_const)))
+                for u in range(num_unrolled):
+                    ur = unroll_regs[u]
+                    body.append(("alu", ("==", ur['tmp1'], ur['tmp1'], zero_const)))
+                for u in range(num_unrolled):
+                    ur = unroll_regs[u]
+                    body.append(("alu", ("-", ur['tmp3'], two_const, ur['tmp1'])))
+                for u in range(num_unrolled):
+                    ur = unroll_regs[u]
+                    body.append(("alu", ("*", ur['idx'], ur['idx'], two_const)))
+                for u in range(num_unrolled):
+                    ur = unroll_regs[u]
+                    body.append(("alu", ("+", ur['idx'], ur['idx'], ur['tmp3'])))
                 for u in range(num_unrolled):
                     i = i_base + u
                     ur = unroll_regs[u]
-                    # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                    body.append(("alu", ("%", ur['tmp1'], ur['val'], two_const)))
-                    body.append(("alu", ("==", ur['tmp1'], ur['tmp1'], zero_const)))
-                    # Flow elimination: select(cond, 1, 2) == 2 - cond
-                    body.append(("alu", ("-", ur['tmp3'], two_const, ur['tmp1'])))
-                    body.append(("alu", ("*", ur['idx'], ur['idx'], two_const)))
-                    body.append(("alu", ("+", ur['idx'], ur['idx'], ur['tmp3'])))
                     body.append(("debug", ("compare", ur['idx'], (round, i, "next_idx"))))
                 
-                # Stage 7: Bounds checking with flow elimination
+                # Stage 7: Bounds checking - flow elimination
+                for u in range(num_unrolled):
+                    ur = unroll_regs[u]
+                    body.append(("alu", ("<", ur['tmp1'], ur['idx'], self.scratch["n_nodes"])))
+                for u in range(num_unrolled):
+                    ur = unroll_regs[u]
+                    body.append(("alu", ("*", ur['idx'], ur['tmp1'], ur['idx'])))
                 for u in range(num_unrolled):
                     i = i_base + u
                     ur = unroll_regs[u]
-                    # idx = 0 if idx >= n_nodes else idx
-                    body.append(("alu", ("<", ur['tmp1'], ur['idx'], self.scratch["n_nodes"])))
-                    # Flow elimination: select(cond, idx, 0) == cond * idx
-                    body.append(("alu", ("*", ur['idx'], ur['tmp1'], ur['idx'])))
                     body.append(("debug", ("compare", ur['idx'], (round, i, "wrapped_idx"))))
                 
-                # Stage 8: Store results (parallel, uses 2 store slots)
+                # Stage 8: Stores - address calculations + stores
                 for u in range(num_unrolled):
                     i = i_base + u
                     i_const = self.scratch_const(i)
                     ur = unroll_regs[u]
                     body.append(("alu", ("+", ur['addr'], self.scratch["inp_indices_p"], i_const)))
+                for u in range(num_unrolled):
+                    ur = unroll_regs[u]
                     body.append(("store", ("store", ur['addr'], ur['idx'])))
+                for u in range(num_unrolled):
+                    i = i_base + u
+                    i_const = self.scratch_const(i)
+                    ur = unroll_regs[u]
                     body.append(("alu", ("+", ur['addr'], self.scratch["inp_values_p"], i_const)))
+                for u in range(num_unrolled):
+                    ur = unroll_regs[u]
                     body.append(("store", ("store", ur['addr'], ur['val'])))
 
         body_instrs = self.build(body, vliw=True)
