@@ -90,16 +90,17 @@ class KernelBuilder:
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
         """
-        VLIW packing with dependency-aware scheduling.
-        Packs instructions into bundles respecting SLOT_LIMITS and data dependencies.
+        TWO-PASS VLIW SCHEDULER: Self-referential optimization.
+        Pass 1: Greedy packing
+        Pass 2: Local bubble-filling optimization (limited scope for speed)
         """
         if not vliw:
-            # Simple slot packing that just uses one slot per instruction bundle
             instrs = []
             for engine, slot in slots:
                 instrs.append({engine: [slot]})
             return instrs
         
+        # PASS 1: Greedy packing
         instrs = []
         current_bundle = {}
         slot_counts = {engine: 0 for engine in SLOT_LIMITS}
@@ -108,22 +109,19 @@ class KernelBuilder:
         for engine, slot in slots:
             reads, writes = self._analyze_dependencies(engine, slot)
             
-            # Check: slot available AND no Read-After-Write hazard AND no Write-After-Write hazard
             can_add = (
                 slot_counts[engine] < SLOT_LIMITS[engine] and
                 not (reads & written_this_cycle) and
-                not (writes & written_this_cycle)  # Prevent WAW hazards
+                not (writes & written_this_cycle)
             )
             
             if not can_add:
-                # Emit bundle, start fresh cycle
                 if current_bundle:
                     instrs.append(current_bundle)
                 current_bundle = {}
                 slot_counts = {e: 0 for e in SLOT_LIMITS}
                 written_this_cycle = set()
             
-            # Add to bundle
             if engine not in current_bundle:
                 current_bundle[engine] = []
             current_bundle[engine].append(slot)
@@ -133,7 +131,98 @@ class KernelBuilder:
         if current_bundle:
             instrs.append(current_bundle)
         
+        # PASS 2: Self-referential - lightweight local optimization
+        instrs = self._local_bubble_fill(instrs)
+        
         return instrs
+    
+    def _local_bubble_fill(self, bundles: list[dict]) -> list[dict]:
+        """
+        Conservative local optimization: look ahead a few bundles and try to pull
+        instructions to fill bubbles while carefully checking ALL dependencies.
+        """
+        if len(bundles) <= 1:
+            return bundles
+        
+        LOOKAHEAD = 3  # Conservative lookahead
+        
+        # Precompute dependencies for all bundles
+        bundle_deps = []
+        for bundle in bundles:
+            reads = set()
+            writes = set()
+            for engine, slots in bundle.items():
+                for slot in slots:
+                    r, w = self._analyze_dependencies(engine, slot)
+                    reads.update(r)
+                    writes.update(w)
+            bundle_deps.append((reads, writes))
+        
+        for i in range(len(bundles)):
+            # Calculate current slot usage
+            slot_usage = {e: 0 for e in SLOT_LIMITS}
+            for engine, slots in bundles[i].items():
+                slot_usage[engine] = len(slots)
+            
+            # Skip if all slots are full
+            if all(slot_usage[e] >= SLOT_LIMITS[e] for e in SLOT_LIMITS):
+                continue
+            
+            # Try to pull from next few bundles
+            for j in range(i + 1, min(i + 1 + LOOKAHEAD, len(bundles))):
+                if not bundles[j]:
+                    continue
+                
+                # For each engine, try to move ONE instruction at a time
+                for engine in list(bundles[j].keys()):
+                    if slot_usage[engine] >= SLOT_LIMITS[engine]:
+                        continue
+                    
+                    slots_in_j = bundles[j][engine]
+                    if not slots_in_j:
+                        continue
+                    
+                    # Try first instruction
+                    candidate = slots_in_j[0]
+                    r, w = self._analyze_dependencies(engine, candidate)
+                    
+                    # Check that moving this instruction doesn't violate dependencies
+                    # with bundles i and all intermediate bundles between i and j
+                    safe = True
+                    
+                    # Check bundle i
+                    if (r & bundle_deps[i][1]) or (w & bundle_deps[i][1]) or (w & bundle_deps[i][0]):
+                        safe = False
+                    
+                    # Check intermediate bundles
+                    if safe:
+                        for k in range(i + 1, j):
+                            kr, kw = bundle_deps[k]
+                            if (r & kw) or (w & kr) or (w & kw):
+                                safe = False
+                                break
+                    
+                    if safe:
+                        # Move it
+                        if engine not in bundles[i]:
+                            bundles[i][engine] = []
+                        bundles[i][engine].append(candidate)
+                        
+                        # Remove from bundle j
+                        bundles[j][engine] = slots_in_j[1:]
+                        if not bundles[j][engine]:
+                            del bundles[j][engine]
+                        
+                        # Update dependencies and slot usage
+                        bundle_deps[i] = (
+                            bundle_deps[i][0] | r,
+                            bundle_deps[i][1] | w
+                        )
+                        slot_usage[engine] += 1
+        
+        # Remove empty bundles
+        return [b for b in bundles if b]
+    
     
     def _analyze_dependencies(self, engine: str, slot: tuple):
         """Extract read/write register sets for dependency analysis."""
