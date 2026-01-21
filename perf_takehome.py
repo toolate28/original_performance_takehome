@@ -520,18 +520,22 @@ class KernelBuilder:
                 self.emit(valu=xor_ops)
 
                 # PHASE 4: HASH ALL groups in parallel
+                # φ-OPTIMIZATION: Interleave ops1 and ops3 for better packing
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     v_c1, v_c3 = hash_consts[hi]
 
-                    # All 6 groups do op1 simultaneously
-                    ops1 = [(op1, hash_v1[bg], v_val[bg], v_c1) for bg in range(batch_size_actual)]
-                    self.emit(valu=ops1)
+                    # Combine up to 6 ops per bundle (3 groups * 2 ops each)
+                    ops1_3 = []
+                    for bg in range(batch_size_actual):
+                        ops1_3.append((op1, hash_v1[bg], v_val[bg], v_c1))
+                    for bg in range(batch_size_actual):
+                        ops1_3.append((op3, hash_v2[bg], v_val[bg], v_c3))
 
-                    # All 6 groups do op3 simultaneously
-                    ops3 = [(op3, hash_v2[bg], v_val[bg], v_c3) for bg in range(batch_size_actual)]
-                    self.emit(valu=ops3)
+                    # Emit in chunks of 6
+                    for offset in range(0, len(ops1_3), 6):
+                        self.emit(valu=ops1_3[offset:offset+6])
 
-                    # All 6 groups do op2 simultaneously
+                    # Then op2 (depends on hash_v1 and hash_v2)
                     ops2 = [(op2, v_val[bg], hash_v1[bg], hash_v2[bg]) for bg in range(batch_size_actual)]
                     self.emit(valu=ops2)
 
