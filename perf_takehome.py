@@ -59,12 +59,29 @@ class KernelBuilder:
                 _, dest, addr = slot
                 writes.add(dest)
                 reads.add(addr)
+            elif slot[0] == "load_offset":
+                _, dest, addr, offset = slot
+                writes.add(dest + offset)
+                reads.add(addr + offset)
+            elif slot[0] == "vload":
+                # vload reads from addr (scalar) and writes to dest:dest+VLEN
+                _, dest, addr = slot
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                reads.add(addr)
             elif slot[0] == "const":
                 _, dest, _ = slot
                 writes.add(dest)
         elif engine == "store":
-            _, addr, val = slot
-            reads.update([addr, val])
+            if slot[0] == "store":
+                _, addr, val = slot
+                reads.update([addr, val])
+            elif slot[0] == "vstore":
+                # vstore reads from addr (scalar) and src:src+VLEN
+                _, addr, src = slot
+                reads.add(addr)
+                for i in range(VLEN):
+                    reads.add(src + i)
         elif engine == "flow":
             if slot[0] == "select":
                 _, dest, cond, a, b = slot
@@ -78,6 +95,19 @@ class KernelBuilder:
             if slot[0] == "compare":
                 _, reg, _ = slot
                 reads.add(reg)
+        elif engine == "valu":
+            if slot[0] == "vbroadcast":
+                _, dest, src = slot
+                reads.add(src)
+                for i in range(VLEN):
+                    writes.add(dest + i)
+            else:
+                # Regular valu operations (e.g., "+", "*", etc.)
+                op, dest, src1, src2 = slot
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                    reads.add(src1 + i)
+                    reads.add(src2 + i)
         
         return reads, writes
 
