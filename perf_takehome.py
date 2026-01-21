@@ -45,11 +45,107 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]]):
-        # Simple slot packing that just uses one slot per instruction bundle
+    def _analyze_dependencies(self, engine: Engine, slot: tuple):
+        """Analyze read and write dependencies for an instruction."""
+        reads = set()
+        writes = set()
+        
+        if engine == "alu":
+            # ALU: (op, dest, src1, src2)
+            op, dest, src1, src2 = slot
+            writes.add(dest)
+            reads.add(src1)
+            reads.add(src2)
+        elif engine == "load":
+            if slot[0] == "const":
+                # const: (const, dest, val)
+                writes.add(slot[1])
+            elif slot[0] == "load":
+                # load: (load, dest, addr)
+                writes.add(slot[1])
+                reads.add(slot[2])
+            elif slot[0] == "vload":
+                # vload: (vload, dest, addr)
+                writes.add(slot[1])
+                reads.add(slot[2])
+        elif engine == "store":
+            if slot[0] == "store":
+                # store: (store, addr, src)
+                reads.add(slot[1])
+                reads.add(slot[2])
+            elif slot[0] == "vstore":
+                # vstore: (vstore, addr, src)
+                reads.add(slot[1])
+                reads.add(slot[2])
+        elif engine == "flow":
+            if slot[0] == "select":
+                # select: (select, dest, cond, a, b)
+                writes.add(slot[1])
+                reads.add(slot[2])
+                reads.add(slot[3])
+                reads.add(slot[4])
+            elif slot[0] in ["pause", "halt"]:
+                pass  # No dependencies
+            else:
+                # Conservative: assume reads and writes
+                pass
+        elif engine == "debug":
+            # Debug operations don't affect actual execution
+            if slot[0] == "compare":
+                reads.add(slot[1])
+        
+        return reads, writes
+
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = True):
+        """
+        Build instruction bundles with dependency-aware packing.
+        Packs independent instructions into bundles respecting SLOT_LIMITS.
+        """
+        if not vliw:
+            # Fallback to simple one-per-cycle for debugging
+            instrs = []
+            for engine, slot in slots:
+                instrs.append({engine: [slot]})
+            return instrs
+        
         instrs = []
+        current_bundle = {}
+        current_writes = set()
+        current_reads = set()
+        engine_counts = defaultdict(int)
+        
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            reads, writes = self._analyze_dependencies(engine, slot)
+            
+            # Check for RAW hazard: reading what hasn't been written yet
+            has_hazard = bool(reads & current_writes)
+            
+            # Check if we've exceeded slot limits
+            would_exceed_limit = engine_counts[engine] >= SLOT_LIMITS.get(engine, 1)
+            
+            # Start new bundle if hazard detected or slot limit reached
+            if has_hazard or would_exceed_limit:
+                if current_bundle:
+                    instrs.append(current_bundle)
+                current_bundle = {}
+                current_writes = set()
+                current_reads = set()
+                engine_counts = defaultdict(int)
+            
+            # Add instruction to current bundle
+            if engine not in current_bundle:
+                current_bundle[engine] = []
+            current_bundle[engine].append(slot)
+            engine_counts[engine] += 1
+            
+            # Update dependency tracking
+            current_reads.update(reads)
+            current_writes.update(writes)
+        
+        # Add final bundle
+        if current_bundle:
+            instrs.append(current_bundle)
+        
         return instrs
 
     def add(self, engine, slot):
@@ -71,13 +167,20 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
+    def build_hash(self, val_hash_addr, hash_tmp1_addrs, hash_tmp2_addrs, round, i):
+        """
+        Optimized hash with operation grouping for ILP within each stage.
+        Hash stages are sequential, but op1 and op3 can run in parallel.
+        Uses pre-allocated temporaries per unroll iteration.
+        """
         slots = []
-
+        
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
+            # op1 and op3 can run in parallel (both read val_hash_addr)
+            slots.append(("alu", (op1, hash_tmp1_addrs[hi], val_hash_addr, self.scratch_const(val1))))
+            slots.append(("alu", (op3, hash_tmp2_addrs[hi], val_hash_addr, self.scratch_const(val3))))
+            # op2 depends on op1 and op3
+            slots.append(("alu", (op2, val_hash_addr, hash_tmp1_addrs[hi], hash_tmp2_addrs[hi])))
             slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
 
         return slots
@@ -87,7 +190,7 @@ class KernelBuilder:
     ):
         """
         Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Optimized with Fibonacci unrolling and software pipelining.
         """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -108,6 +211,7 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
+        # Pre-allocate constants
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
@@ -122,48 +226,130 @@ class KernelBuilder:
 
         body = []  # array of slots
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        # Fibonacci unrolling factor
+        UNROLL_FACTOR = 13
+        
+        # Allocate separate registers per unrolled iteration
+        tmp_regs = []
+        for u in range(UNROLL_FACTOR):
+            regs = {
+                'idx': self.alloc_scratch(f"tmp_idx_{u}"),
+                'val': self.alloc_scratch(f"tmp_val_{u}"),
+                'node_val': self.alloc_scratch(f"tmp_node_val_{u}"),
+                'addr': self.alloc_scratch(f"tmp_addr_{u}"),
+                'tmp1': self.alloc_scratch(f"tmp1_{u}"),
+                'tmp2': self.alloc_scratch(f"tmp2_{u}"),
+                'tmp3': self.alloc_scratch(f"tmp3_{u}"),
+            }
+            # Allocate hash temporaries per unroll iteration
+            regs['hash_tmp1'] = [self.alloc_scratch(f"hash_tmp1_{u}_{hi}") for hi in range(len(HASH_STAGES))]
+            regs['hash_tmp2'] = [self.alloc_scratch(f"hash_tmp2_{u}_{hi}") for hi in range(len(HASH_STAGES))]
+            tmp_regs.append(regs)
 
         for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+            # Process in groups of UNROLL_FACTOR
+            for i_base in range(0, batch_size, UNROLL_FACTOR):
+                # Software pipeline: Stage 1 - Load all indices in parallel
+                for u in range(min(UNROLL_FACTOR, batch_size - i_base)):
+                    i = i_base + u
+                    i_const = self.scratch_const(i)
+                    regs = tmp_regs[u]
+                    # idx = mem[inp_indices_p + i]
+                    body.append(("alu", ("+", regs['addr'], self.scratch["inp_indices_p"], i_const)))
+                    body.append(("load", ("load", regs['idx'], regs['addr'])))
+                
+                # Debug stage 1
+                for u in range(min(UNROLL_FACTOR, batch_size - i_base)):
+                    i = i_base + u
+                    regs = tmp_regs[u]
+                    body.append(("debug", ("compare", regs['idx'], (round, i, "idx"))))
+                
+                # Stage 2 - Load all values in parallel
+                for u in range(min(UNROLL_FACTOR, batch_size - i_base)):
+                    i = i_base + u
+                    i_const = self.scratch_const(i)
+                    regs = tmp_regs[u]
+                    # val = mem[inp_values_p + i]
+                    body.append(("alu", ("+", regs['addr'], self.scratch["inp_values_p"], i_const)))
+                    body.append(("load", ("load", regs['val'], regs['addr'])))
+                
+                # Debug stage 2
+                for u in range(min(UNROLL_FACTOR, batch_size - i_base)):
+                    i = i_base + u
+                    regs = tmp_regs[u]
+                    body.append(("debug", ("compare", regs['val'], (round, i, "val"))))
+                
+                # Stage 3 - Load all node values in parallel
+                for u in range(min(UNROLL_FACTOR, batch_size - i_base)):
+                    i = i_base + u
+                    regs = tmp_regs[u]
+                    # node_val = mem[forest_values_p + idx]
+                    body.append(("alu", ("+", regs['addr'], self.scratch["forest_values_p"], regs['idx'])))
+                    body.append(("load", ("load", regs['node_val'], regs['addr'])))
+                
+                # Debug stage 3
+                for u in range(min(UNROLL_FACTOR, batch_size - i_base)):
+                    i = i_base + u
+                    regs = tmp_regs[u]
+                    body.append(("debug", ("compare", regs['node_val'], (round, i, "node_val"))))
+                
+                # Stage 4 - Hash operations in parallel
+                for u in range(min(UNROLL_FACTOR, batch_size - i_base)):
+                    i = i_base + u
+                    regs = tmp_regs[u]
+                    # val = myhash(val ^ node_val)
+                    body.append(("alu", ("^", regs['val'], regs['val'], regs['node_val'])))
+                    body.extend(self.build_hash(regs['val'], regs['hash_tmp1'], regs['hash_tmp2'], round, i))
+                
+                # Debug hash
+                for u in range(min(UNROLL_FACTOR, batch_size - i_base)):
+                    i = i_base + u
+                    regs = tmp_regs[u]
+                    body.append(("debug", ("compare", regs['val'], (round, i, "hashed_val"))))
+                
+                # Stage 5 - Update calculations in parallel
+                for u in range(min(UNROLL_FACTOR, batch_size - i_base)):
+                    i = i_base + u
+                    regs = tmp_regs[u]
+                    # idx = 2*idx + (1 if val % 2 == 0 else 2)
+                    body.append(("alu", ("%", regs['tmp1'], regs['val'], two_const)))
+                    body.append(("alu", ("==", regs['tmp1'], regs['tmp1'], zero_const)))
+                    # Replace select with arithmetic: tmp3 = 2 - tmp1 (when tmp1 is 0 or 1)
+                    body.append(("alu", ("-", regs['tmp3'], two_const, regs['tmp1'])))
+                    body.append(("alu", ("*", regs['idx'], regs['idx'], two_const)))
+                    body.append(("alu", ("+", regs['idx'], regs['idx'], regs['tmp3'])))
+                
+                # Debug next_idx
+                for u in range(min(UNROLL_FACTOR, batch_size - i_base)):
+                    i = i_base + u
+                    regs = tmp_regs[u]
+                    body.append(("debug", ("compare", regs['idx'], (round, i, "next_idx"))))
+                
+                # Wrap indices
+                for u in range(min(UNROLL_FACTOR, batch_size - i_base)):
+                    i = i_base + u
+                    regs = tmp_regs[u]
+                    # idx = 0 if idx >= n_nodes else idx
+                    body.append(("alu", ("<", regs['tmp1'], regs['idx'], self.scratch["n_nodes"])))
+                    body.append(("flow", ("select", regs['idx'], regs['tmp1'], regs['idx'], zero_const)))
+                
+                # Debug wrapped_idx
+                for u in range(min(UNROLL_FACTOR, batch_size - i_base)):
+                    i = i_base + u
+                    regs = tmp_regs[u]
+                    body.append(("debug", ("compare", regs['idx'], (round, i, "wrapped_idx"))))
+                
+                # Stage 6 - Store all results in parallel
+                for u in range(min(UNROLL_FACTOR, batch_size - i_base)):
+                    i = i_base + u
+                    i_const = self.scratch_const(i)
+                    regs = tmp_regs[u]
+                    # mem[inp_indices_p + i] = idx
+                    body.append(("alu", ("+", regs['addr'], self.scratch["inp_indices_p"], i_const)))
+                    body.append(("store", ("store", regs['addr'], regs['idx'])))
+                    # mem[inp_values_p + i] = val
+                    body.append(("alu", ("+", regs['addr'], self.scratch["inp_values_p"], i_const)))
+                    body.append(("store", ("store", regs['addr'], regs['val'])))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
