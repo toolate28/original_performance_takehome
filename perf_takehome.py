@@ -131,17 +131,18 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1_base, tmp2_base, round, i):
-        """Group hash operations by type for parallel execution"""
+    def build_hash(self, val_hash_addr, hash_tmp1_addrs, hash_tmp2_addrs, round, i):
+        """Hash operations with op1/op3 parallelized per stage"""
         slots = []
         
-        # Use the provided temporaries directly (no offset calculation)
-        # Phase 1&2: All op1 and op3 operations can't truly be parallel since they use same temps
-        # But we can group them better
+        # For each stage, op1 and op3 can execute in parallel (both read val_hash_addr)
+        # Then op2 must wait for both to complete
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1_base, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2_base, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1_base, tmp2_base)))
+            # Execute op1 and op3 in parallel - they both only read val_hash_addr
+            slots.append(("alu", (op1, hash_tmp1_addrs[hi], val_hash_addr, self.scratch_const(val1))))
+            slots.append(("alu", (op3, hash_tmp2_addrs[hi], val_hash_addr, self.scratch_const(val3))))
+            # op2 depends on both tmp1 and tmp2, writes to val_hash_addr
+            slots.append(("alu", (op2, val_hash_addr, hash_tmp1_addrs[hi], hash_tmp2_addrs[hi])))
             slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
         
         return slots
@@ -190,6 +191,13 @@ class KernelBuilder:
         # Allocate separate registers per unrolled iteration (eliminate RAW hazards)
         tmp_regs = []
         for u in range(UNROLL_FACTOR):
+            # Pre-allocate hash temporaries for each unrolled iteration
+            hash_tmp1_addrs = []
+            hash_tmp2_addrs = []
+            for hi in range(len(HASH_STAGES)):
+                hash_tmp1_addrs.append(self.alloc_scratch(f"hash_tmp1_{u}_{hi}"))
+                hash_tmp2_addrs.append(self.alloc_scratch(f"hash_tmp2_{u}_{hi}"))
+            
             tmp_regs.append({
                 'idx': self.alloc_scratch(f"tmp_idx_{u}"),
                 'val': self.alloc_scratch(f"tmp_val_{u}"),
@@ -198,6 +206,8 @@ class KernelBuilder:
                 'tmp1': self.alloc_scratch(f"tmp1_{u}"),
                 'tmp2': self.alloc_scratch(f"tmp2_{u}"),
                 'tmp3': self.alloc_scratch(f"tmp3_{u}"),
+                'hash_tmp1_addrs': hash_tmp1_addrs,
+                'hash_tmp2_addrs': hash_tmp2_addrs,
             })
         
         # Pre-allocate constants for all batch indices
@@ -252,15 +262,42 @@ class KernelBuilder:
                     tr = tmp_regs[u]
                     body.append(("debug", ("compare", tr['node_val'], (round, i, "node_val"))))
                 
-                # Stage 4: Hash all values
+                # Stage 4: Hash all values - interleave operations from all iterations
+                # XOR operations for all iterations
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
                     body.append(("alu", ("^", tr['val'], tr['val'], tr['node_val'])))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.extend(self.build_hash(tr['val'], tr['tmp1'], tr['tmp2'], round, i))
+                
+                # Hash operations interleaved by stage
+                for hi in range(len(HASH_STAGES)):
+                    op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                    
+                    # All op1 operations for this stage across all iterations
+                    for u in range(num_iters):
+                        i = i_base + u
+                        tr = tmp_regs[u]
+                        body.append(("alu", (op1, tr['hash_tmp1_addrs'][hi], tr['val'], self.scratch_const(val1))))
+                    
+                    # All op3 operations for this stage across all iterations
+                    for u in range(num_iters):
+                        i = i_base + u
+                        tr = tmp_regs[u]
+                        body.append(("alu", (op3, tr['hash_tmp2_addrs'][hi], tr['val'], self.scratch_const(val3))))
+                    
+                    # All op2 operations for this stage across all iterations
+                    for u in range(num_iters):
+                        i = i_base + u
+                        tr = tmp_regs[u]
+                        body.append(("alu", (op2, tr['val'], tr['hash_tmp1_addrs'][hi], tr['hash_tmp2_addrs'][hi])))
+                    
+                    # Debug comparisons for this stage
+                    for u in range(num_iters):
+                        i = i_base + u
+                        tr = tmp_regs[u]
+                        body.append(("debug", ("compare", tr['val'], (round, i, "hash_stage", hi))))
+                
+                # Final hash value comparison
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
