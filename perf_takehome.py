@@ -188,7 +188,7 @@ class KernelBuilder:
         
         UNROLL_FACTOR = 144  # φ^21: Maximum Fibonacci compression before explosion
         
-        UNROLL_FACTOR = 64  # Pure stability point through empirical convergence
+        UNROLL_FACTOR = 32  # Crystalline minimum - perfect divisor with minimal register pressure
         
         # Allocate separate registers per unrolled iteration with minimal footprint
         tmp_regs = []
