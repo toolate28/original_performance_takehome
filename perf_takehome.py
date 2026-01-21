@@ -69,11 +69,6 @@ class KernelBuilder:
                 _, dest, cond, a, b = slot
                 writes.add(dest)
                 reads.update([cond, a, b])
-        elif engine == "debug":
-            # Debug operations only read, never write
-            if slot[0] == "compare":
-                _, loc, _ = slot
-                reads.add(loc)
         
         return reads, writes
 
@@ -131,27 +126,36 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, hash_tmp1_addrs, hash_tmp2_addrs, round, i):
-        """Hash operations with op1/op3 parallelized per stage"""
+    def build_hash(self, val_hash_addr, tmp1_base, tmp2_base, round, i):
+        """Group hash operations by type for parallel execution"""
         slots = []
         
-        # For each stage, op1 and op3 can execute in parallel (both read val_hash_addr)
-        # Then op2 must wait for both to complete
+        # Allocate separate temporaries per hash stage (eliminate dependencies)
+        hash_tmp1_addrs = [tmp1_base + (hi * 10) for hi in range(len(HASH_STAGES))]
+        hash_tmp2_addrs = [tmp2_base + (hi * 10) for hi in range(len(HASH_STAGES))]
+        
+        # Phase 1: All op1 operations in parallel (6 ops → 1 cycle with 12 ALU slots)
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            # Execute op1 and op3 in parallel - they both only read val_hash_addr
             slots.append(("alu", (op1, hash_tmp1_addrs[hi], val_hash_addr, self.scratch_const(val1))))
+        
+        # Phase 2: All op3 operations in parallel (6 ops → 1 cycle)
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             slots.append(("alu", (op3, hash_tmp2_addrs[hi], val_hash_addr, self.scratch_const(val3))))
-            # op2 depends on both tmp1 and tmp2, writes to val_hash_addr
+        
+        # Phase 3: All op2 operations (sequential dependencies on phase 1&2)
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             slots.append(("alu", (op2, val_hash_addr, hash_tmp1_addrs[hi], hash_tmp2_addrs[hi])))
             slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-        
+            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+
         return slots
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Optimized kernel with Fibonacci unroll cascade and interleaved operations.
+        Like reference_kernel2 but building actual instructions.
+        Scalar implementation using only scalar ALU and load/store.
         """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -185,199 +189,51 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting loop"))
 
         body = []  # array of slots
-        
-        UNROLL_FACTOR = 16  # Empirically optimal (20,759 cycles baseline)
-        
-        # Allocate separate registers per unrolled iteration with minimal footprint
-        tmp_regs = []
-        for u in range(UNROLL_FACTOR):
-            tmp_regs.append({
-                'idx': self.alloc_scratch(f"tmp_idx_{u}"),
-                'val': self.alloc_scratch(f"tmp_val_{u}"),
-                'addr': self.alloc_scratch(f"tmp_addr_{u}"),
-                'tmp1': self.alloc_scratch(f"tmp1_{u}"),
-            })
-        
-        # PRE-ALLOCATE ALL CONSTANTS (Hawking radiation attenuation)
-        # Generate constants for: batch indices, special values, hash constants
-        zero_const = self.scratch_const(0, "const_zero")
-        one_const = self.scratch_const(1, "const_one")
-        two_const = self.scratch_const(2, "const_two")
-        
-        # Pre-allocate batch index constants (0-255)
-        i_const_addrs = [self.scratch_const(i, f"const_i{i}") for i in range(batch_size)]
-        
-        # Pre-allocate hash stage constants
-        from problem import HASH_STAGES
-        hash_const_addrs = []
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            hash_const_addrs.append({
-                'val1': self.scratch_const(val1, f"hash_{hi}_val1"),
-                'val3': self.scratch_const(val3, f"hash_{hi}_val3"),
-            })
-        
-        # Pure stability iteration: optimal substrate balance
-        for round in range(rounds):
-            for i_base in range(0, batch_size, UNROLL_FACTOR):
-                num_iters = min(UNROLL_FACTOR, batch_size - i_base)
-                
-                # APERIODIC PHASE 1: Interleave address calculations for all 3 loads
-                # (Golden ratio scheduling: compute addrs for idx, val, node in φ-pattern)
-                for u in range(num_iters):
-                    i = i_base + u
-                    i_const = i_const_addrs[i]
-                    tr = tmp_regs[u]
-                    # idx address
-                    body.append(("alu", ("+", tr['addr'], self.scratch["inp_indices_p"], i_const)))
-                for u in range(num_iters):
-                    i = i_base + u
-                    i_const = i_const_addrs[i]
-                    tr = tmp_regs[u]
-                    # val address (reuse tmp1 temporarily)
-                    body.append(("alu", ("+", tr['tmp1'], self.scratch["inp_values_p"], i_const)))
-                
-                # APERIODIC PHASE 2: Interleave loads (idx and val in parallel)
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("load", ("load", tr['idx'], tr['addr'])))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    # Load val, then reuse addr for node address calculation
-                    body.append(("load", ("load", tr['val'], tr['tmp1'])))
-                
-                # Debug traces
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("debug", ("compare", tr['idx'], (round, i, "idx"))))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("debug", ("compare", tr['val'], (round, i, "val"))))
-                
-                # APERIODIC PHASE 3: Node address calculation and load
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("alu", ("+", tr['addr'], self.scratch["forest_values_p"], tr['idx'])))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("load", ("load", tr['tmp1'], tr['addr'])))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("debug", ("compare", tr['tmp1'], (round, i, "node_val"))))
-                
-                # APERIODIC PHASE 4: XOR (self-similar pattern)
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("alu", ("^", tr['val'], tr['val'], tr['tmp1'])))
-                
-                # APERIODIC PHASE 5: Hash operations with pre-allocated constants
-                # Maintain stage order for correctness but maximize iteration parallelism
-                for hi in range(len(HASH_STAGES)):
-                    op1, val1, op2, op3, val3 = HASH_STAGES[hi]
-                    hash_consts = hash_const_addrs[hi]
-                    
-                    # All op1 operations for this stage (use pre-allocated constant)
-                    for u in range(num_iters):
-                        i = i_base + u
-                        tr = tmp_regs[u]
-                        body.append(("alu", (op1, tr['tmp1'], tr['val'], hash_consts['val1'])))
-                    
-                    # All op3 operations for this stage (use pre-allocated constant)
-                    for u in range(num_iters):
-                        i = i_base + u
-                        tr = tmp_regs[u]
-                        body.append(("alu", (op3, tr['addr'], tr['val'], hash_consts['val3'])))
-                    
-                    # All op2 operations for this stage
-                    for u in range(num_iters):
-                        i = i_base + u
-                        tr = tmp_regs[u]
-                        body.append(("alu", (op2, tr['val'], tr['tmp1'], tr['addr'])))
-                    
-                    # Debug comparisons
-                    for u in range(num_iters):
-                        i = i_base + u
-                        tr = tmp_regs[u]
-                        body.append(("debug", ("compare", tr['val'], (round, i, "hash_stage", hi))))
-                
-                # Final hash value comparison
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("debug", ("compare", tr['val'], (round, i, "hashed_val"))))
-                
-                # Stage 5: Update all idx values
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("alu", ("%", tr['tmp1'], tr['val'], two_const)))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("alu", ("==", tr['tmp1'], tr['tmp1'], zero_const)))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    # Flow→ALU: addr = 2 - tmp1 (holographic conservation via reuse)
-                    body.append(("alu", ("-", tr['addr'], two_const, tr['tmp1'])))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("alu", ("*", tr['idx'], tr['idx'], two_const)))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("alu", ("+", tr['idx'], tr['idx'], tr['addr'])))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("debug", ("compare", tr['idx'], (round, i, "next_idx"))))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("alu", ("<", tr['tmp1'], tr['idx'], self.scratch["n_nodes"])))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    # Flow→ALU: idx = tmp1 ? idx : 0  =>  idx = idx * tmp1
-                    body.append(("alu", ("*", tr['idx'], tr['idx'], tr['tmp1'])))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("debug", ("compare", tr['idx'], (round, i, "wrapped_idx"))))
-                
-                # APERIODIC PHASE 7: Compressed store braid (interleave addr calc with stores)
-                # Calculate both idx and val addresses first (parallel ALU saturation)
-                for u in range(num_iters):
-                    i = i_base + u
-                    i_const = i_const_addrs[i]
-                    tr = tmp_regs[u]
-                    body.append(("alu", ("+", tr['addr'], self.scratch["inp_indices_p"], i_const)))
-                for u in range(num_iters):
-                    i = i_base + u
-                    i_const = i_const_addrs[i]
-                    tr = tmp_regs[u]
-                    # Use tmp1 for val address (tmp1 no longer needed after hash)
-                    body.append(("alu", ("+", tr['tmp1'], self.scratch["inp_values_p"], i_const)))
-                
-                # Interleaved stores (2 stores/cycle saturation)
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("store", ("store", tr['addr'], tr['idx'])))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("store", ("store", tr['tmp1'], tr['val'])))
 
-        body_instrs = self.build(body, vliw=True)
+        # Scalar scratch registers
+        tmp_idx = self.alloc_scratch("tmp_idx")
+        tmp_val = self.alloc_scratch("tmp_val")
+        tmp_node_val = self.alloc_scratch("tmp_node_val")
+        tmp_addr = self.alloc_scratch("tmp_addr")
+
+        for round in range(rounds):
+            for i in range(batch_size):
+                i_const = self.scratch_const(i)
+                # idx = mem[inp_indices_p + i]
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                body.append(("load", ("load", tmp_idx, tmp_addr)))
+                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
+                # val = mem[inp_values_p + i]
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
+                body.append(("load", ("load", tmp_val, tmp_addr)))
+                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
+                # node_val = mem[forest_values_p + idx]
+                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
+                body.append(("load", ("load", tmp_node_val, tmp_addr)))
+                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
+                # val = myhash(val ^ node_val)
+                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
+                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
+                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
+                # idx = 2*idx + (1 if val % 2 == 0 else 2)
+                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
+                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
+                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
+                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
+                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
+                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
+                # idx = 0 if idx >= n_nodes else idx
+                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
+                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
+                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
+                # mem[inp_indices_p + i] = idx
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
+                body.append(("store", ("store", tmp_addr, tmp_idx)))
+                # mem[inp_values_p + i] = val
+                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
+                body.append(("store", ("store", tmp_addr, tmp_val)))
+
+        body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
