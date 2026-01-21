@@ -45,11 +45,121 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]]):
-        # Simple slot packing that just uses one slot per instruction bundle
+    def _analyze_dependencies(self, engine: Engine, slot: tuple):
+        """
+        Analyze dependencies for a given engine and slot.
+        Returns (reads: set, writes: set) of scratch addresses.
+        """
+        reads = set()
+        writes = set()
+        
+        if engine == "alu":
+            # (op, dest, src1, src2)
+            op, dest, src1, src2 = slot
+            reads.add(src1)
+            reads.add(src2)
+            writes.add(dest)
+        elif engine == "load":
+            if slot[0] == "const":
+                # ("const", dest, val) - only writes
+                writes.add(slot[1])
+            elif slot[0] == "load":
+                # ("load", dest, addr)
+                writes.add(slot[1])
+                reads.add(slot[2])
+            elif slot[0] == "vload":
+                # ("vload", dest, addr)
+                dest, addr = slot[1], slot[2]
+                for i in range(8):  # VLEN = 8
+                    writes.add(dest + i)
+                reads.add(addr)
+        elif engine == "store":
+            if slot[0] == "store":
+                # ("store", addr, src)
+                reads.add(slot[1])
+                reads.add(slot[2])
+            elif slot[0] == "vstore":
+                # ("vstore", addr, src)
+                addr, src = slot[1], slot[2]
+                reads.add(addr)
+                for i in range(8):  # VLEN = 8
+                    reads.add(src + i)
+        elif engine == "flow":
+            if slot[0] == "select":
+                # ("select", dest, cond, a, b)
+                writes.add(slot[1])
+                reads.add(slot[2])
+                reads.add(slot[3])
+                reads.add(slot[4])
+            elif slot[0] == "add_imm":
+                # ("add_imm", dest, a, imm)
+                writes.add(slot[1])
+                reads.add(slot[2])
+            elif slot[0] == "vselect":
+                # ("vselect", dest, cond, a, b)
+                dest, cond, a, b = slot[1], slot[2], slot[3], slot[4]
+                for i in range(8):  # VLEN = 8
+                    writes.add(dest + i)
+                    reads.add(cond + i)
+                    reads.add(a + i)
+                    reads.add(b + i)
+            elif slot[0] in ["pause", "halt"]:
+                pass  # No dependencies
+        elif engine == "debug":
+            # Debug operations have no real dependencies
+            pass
+        
+        return (reads, writes)
+    
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = True):
+        """
+        Pack slots into VLIW instruction bundles with dependency awareness.
+        """
+        if not vliw:
+            # Fall back to naive packing for debugging
+            instrs = []
+            for engine, slot in slots:
+                instrs.append({engine: [slot]})
+            return instrs
+        
         instrs = []
+        current_bundle = {}
+        slot_counts = defaultdict(int)
+        written_this_cycle = set()
+        
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            reads, writes = self._analyze_dependencies(engine, slot)
+            
+            # Check if we can add this slot to the current bundle
+            can_add = True
+            
+            # Check slot limit
+            if slot_counts[engine] >= SLOT_LIMITS.get(engine, 1):
+                can_add = False
+            
+            # Check for RAW (Read-After-Write) hazard
+            if reads & written_this_cycle:
+                can_add = False
+            
+            # If we can't add to current bundle, emit it and start a new one
+            if not can_add:
+                if current_bundle:
+                    instrs.append(current_bundle)
+                current_bundle = {}
+                slot_counts = defaultdict(int)
+                written_this_cycle = set()
+            
+            # Add slot to current bundle
+            if engine not in current_bundle:
+                current_bundle[engine] = []
+            current_bundle[engine].append(slot)
+            slot_counts[engine] += 1
+            written_this_cycle.update(writes)
+        
+        # Emit final bundle
+        if current_bundle:
+            instrs.append(current_bundle)
+        
         return instrs
 
     def add(self, engine, slot):
