@@ -287,8 +287,10 @@ class KernelBuilder:
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         
-        # Scalar temporaries
-        addr_tmp = [self.alloc_scratch(f"addr_tmp{u}") for u in range(VEC_UNROLL)]
+        # Scalar temporaries (multiple per vector for forest loads)
+        addr_tmp = []
+        for u in range(VEC_UNROLL):
+            addr_tmp.append([self.alloc_scratch(f"addr{u}_{vi}") for vi in range(VLEN)])
         
         # Pre-allocate constants for hash operations
         hash_constants = []
@@ -312,12 +314,12 @@ class KernelBuilder:
                     i = vec_i * VLEN
                     i_const = self.scratch_const(i)
                     vr = v_regs[u]
-                    at = addr_tmp[u]
+                    at = addr_tmp[u][0]  # Use first address temp for vector loads
                     
                     body.append(("alu", ("+", at, self.scratch["inp_indices_p"], i_const)))
                 for u in range(num_vec_unrolled):
                     vr = v_regs[u]
-                    at = addr_tmp[u]
+                    at = addr_tmp[u][0]
                     body.append(("load", ("vload", vr['idx'], at)))
                 
                 for u in range(num_vec_unrolled):
@@ -325,11 +327,11 @@ class KernelBuilder:
                     i = vec_i * VLEN
                     i_const = self.scratch_const(i)
                     vr = v_regs[u]
-                    at = addr_tmp[u]
+                    at = addr_tmp[u][0]
                     body.append(("alu", ("+", at, self.scratch["inp_values_p"], i_const)))
                 for u in range(num_vec_unrolled):
                     vr = v_regs[u]
-                    at = addr_tmp[u]
+                    at = addr_tmp[u][0]
                     body.append(("load", ("vload", vr['val'], at)))
                 
                 # Debug loaded values
@@ -346,12 +348,18 @@ class KernelBuilder:
                     for vi in range(VLEN):
                         body.append(("debug", ("compare", vr['val'] + vi, (round, i + vi, "val"))))
                 
-                # Stage 2: Load node values (scalar loads)
+                # Stage 2: Load node values (scalar loads - batch all address calculations, then all loads)
+                # Calculate ALL addresses first (use dedicated address temps for each element)
                 for u in range(num_vec_unrolled):
                     vr = v_regs[u]
-                    at = addr_tmp[u]
                     for vi in range(VLEN):
+                        at = addr_tmp[u][vi]
                         body.append(("alu", ("+", at, self.scratch["forest_values_p"], vr['idx'] + vi)))
+                # Then do ALL loads
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    for vi in range(VLEN):
+                        at = addr_tmp[u][vi]
                         body.append(("load", ("load", vr['node_val'] + vi, at)))
                 
                 # Debug node values
@@ -443,11 +451,11 @@ class KernelBuilder:
                     i = vec_i * VLEN
                     i_const = self.scratch_const(i)
                     vr = v_regs[u]
-                    at = addr_tmp[u]
+                    at = addr_tmp[u][0]
                     body.append(("alu", ("+", at, self.scratch["inp_indices_p"], i_const)))
                 for u in range(num_vec_unrolled):
                     vr = v_regs[u]
-                    at = addr_tmp[u]
+                    at = addr_tmp[u][0]
                     body.append(("store", ("vstore", at, vr['idx'])))
                 
                 for u in range(num_vec_unrolled):
@@ -455,11 +463,11 @@ class KernelBuilder:
                     i = vec_i * VLEN
                     i_const = self.scratch_const(i)
                     vr = v_regs[u]
-                    at = addr_tmp[u]
+                    at = addr_tmp[u][0]
                     body.append(("alu", ("+", at, self.scratch["inp_values_p"], i_const)))
                 for u in range(num_vec_unrolled):
                     vr = v_regs[u]
-                    at = addr_tmp[u]
+                    at = addr_tmp[u][0]
                     body.append(("store", ("vstore", at, vr['val'])))
 
         body_instrs = self.build(body, vliw=True)
