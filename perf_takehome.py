@@ -390,9 +390,189 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Use the scalar packed version - simpler and works.
+        MAXIMUM VALU UTILIZATION - 6 slots × 8 elements = 48 ops/cycle potential
+        Target: 0.36 cycles/element through massive vectorization
         """
-        return self.build_kernel_scalar_packed(forest_height, n_nodes, batch_size, rounds)
+        tmp1 = self.alloc_scratch("tmp1")
+
+        # Initialize
+        init_vars = ["rounds", "n_nodes", "batch_size", "forest_height",
+                     "forest_values_p", "inp_indices_p", "inp_values_p"]
+        for v in init_vars:
+            self.alloc_scratch(v, 1)
+        for i, v in enumerate(init_vars):
+            self.add("load", ("const", tmp1, i))
+            self.add("load", ("load", self.scratch[v], tmp1))
+
+        one_const = self.scratch_const(1)
+        two_const = self.scratch_const(2)
+
+        self.add("flow", ("pause",))
+
+        # Process ALL 256 elements as 32 vector groups of 8
+        n_groups = batch_size // VLEN  # 32 groups
+
+        # Allocate vector registers for MULTIPLE groups to enable packing
+        PARALLEL_GROUPS = 6  # Process 6 groups in parallel (48 elements)
+
+        v_idx = [self.alloc_scratch(f"v_idx{g}", VLEN) for g in range(PARALLEL_GROUPS)]
+        v_val = [self.alloc_scratch(f"v_val{g}", VLEN) for g in range(PARALLEL_GROUPS)]
+        v_node = [self.alloc_scratch(f"v_node{g}", VLEN) for g in range(PARALLEL_GROUPS)]
+        v_tmp = [self.alloc_scratch(f"v_tmp{g}", VLEN) for g in range(PARALLEL_GROUPS)]
+        hash_v1 = [self.alloc_scratch(f"hash_v1_{g}", VLEN) for g in range(PARALLEL_GROUPS)]
+        hash_v2 = [self.alloc_scratch(f"hash_v2_{g}", VLEN) for g in range(PARALLEL_GROUPS)]
+
+        # Vector constants - broadcast once
+        v_one = self.alloc_scratch("v_one", VLEN)
+        v_two = self.alloc_scratch("v_two", VLEN)
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+
+        self.emit(valu=[
+            ("vbroadcast", v_one, one_const),
+            ("vbroadcast", v_two, two_const),
+            ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]),
+        ])
+
+        # Pre-allocate ALL hash constant vectors
+        hash_consts = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            v_c1 = self.alloc_scratch(f"vc1_{hi}", VLEN)
+            v_c3 = self.alloc_scratch(f"vc3_{hi}", VLEN)
+            self.emit(valu=[
+                ("vbroadcast", v_c1, self.scratch_const(val1)),
+                ("vbroadcast", v_c3, self.scratch_const(val3)),
+            ])
+            hash_consts.append((v_c1, v_c3))
+
+        # Scalar addressing temporaries
+        tmp_addr = [self.alloc_scratch(f"addr{g}") for g in range(PARALLEL_GROUPS)]
+        node_addr = [[self.alloc_scratch(f"node{g}_{v}") for v in range(VLEN)] for g in range(PARALLEL_GROUPS)]
+
+        # Pre-allocate base addresses
+        base_addrs = [self.scratch_const(g * VLEN) for g in range(n_groups)]
+
+        for round in range(rounds):
+            # Process in batches of PARALLEL_GROUPS
+            for batch_start in range(0, n_groups, PARALLEL_GROUPS):
+                batch_end = min(batch_start + PARALLEL_GROUPS, n_groups)
+                batch_size_actual = batch_end - batch_start
+
+                # PHASE 1: Load ALL indices and values in parallel
+                for bg in range(batch_size_actual):
+                    g = batch_start + bg
+                    self.emit(flow=[("add_imm", tmp_addr[bg], self.scratch["inp_indices_p"], g * VLEN)])
+                for bg in range(batch_size_actual):
+                    self.emit(load=[("vload", v_idx[bg], tmp_addr[bg])])
+
+                for bg in range(batch_size_actual):
+                    g = batch_start + bg
+                    self.emit(flow=[("add_imm", tmp_addr[bg], self.scratch["inp_values_p"], g * VLEN)])
+                for bg in range(batch_size_actual):
+                    self.emit(load=[("vload", v_val[bg], tmp_addr[bg])])
+
+                # Debug
+                for bg in range(batch_size_actual):
+                    g = batch_start + bg
+                    for vi in range(VLEN):
+                        i = g * VLEN + vi
+                        self.emit(debug=[
+                            ("compare", v_idx[bg] + vi, (round, i, "idx")),
+                            ("compare", v_val[bg] + vi, (round, i, "val")),
+                        ])
+
+                # PHASE 2: Calculate node addresses and load (bottleneck - still scalar)
+                for bg in range(batch_size_actual):
+                    for vi in range(VLEN):
+                        self.emit(alu=[("+", node_addr[bg][vi], self.scratch["forest_values_p"], v_idx[bg] + vi)])
+
+                for bg in range(batch_size_actual):
+                    for vi in range(VLEN):
+                        self.emit(load=[("load", v_node[bg] + vi, node_addr[bg][vi])])
+
+                for bg in range(batch_size_actual):
+                    g = batch_start + bg
+                    for vi in range(VLEN):
+                        i = g * VLEN + vi
+                        self.emit(debug=[("compare", v_node[bg] + vi, (round, i, "node_val"))])
+
+                # PHASE 3: XOR ALL groups in parallel (uses all 6 VALU slots)
+                xor_ops = [("^", v_val[bg], v_val[bg], v_node[bg]) for bg in range(batch_size_actual)]
+                self.emit(valu=xor_ops)
+
+                # PHASE 4: HASH ALL groups in parallel
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    v_c1, v_c3 = hash_consts[hi]
+
+                    # All 6 groups do op1 simultaneously
+                    ops1 = [(op1, hash_v1[bg], v_val[bg], v_c1) for bg in range(batch_size_actual)]
+                    self.emit(valu=ops1)
+
+                    # All 6 groups do op3 simultaneously
+                    ops3 = [(op3, hash_v2[bg], v_val[bg], v_c3) for bg in range(batch_size_actual)]
+                    self.emit(valu=ops3)
+
+                    # All 6 groups do op2 simultaneously
+                    ops2 = [(op2, v_val[bg], hash_v1[bg], hash_v2[bg]) for bg in range(batch_size_actual)]
+                    self.emit(valu=ops2)
+
+                    for bg in range(batch_size_actual):
+                        g = batch_start + bg
+                        for vi in range(VLEN):
+                            i = g * VLEN + vi
+                            self.emit(debug=[("compare", v_val[bg] + vi, (round, i, "hash_stage", hi))])
+
+                for bg in range(batch_size_actual):
+                    g = batch_start + bg
+                    for vi in range(VLEN):
+                        i = g * VLEN + vi
+                        self.emit(debug=[("compare", v_val[bg] + vi, (round, i, "hashed_val"))])
+
+                # PHASE 5: Index calculation in parallel
+                mod_ops = [("%", v_tmp[bg], v_val[bg], v_two) for bg in range(batch_size_actual)]
+                self.emit(valu=mod_ops)
+
+                add_ops = [("+", v_tmp[bg], v_one, v_tmp[bg]) for bg in range(batch_size_actual)]
+                self.emit(valu=add_ops)
+
+                mul_ops = [("*", v_idx[bg], v_idx[bg], v_two) for bg in range(batch_size_actual)]
+                self.emit(valu=mul_ops)
+
+                add_ops2 = [("+", v_idx[bg], v_idx[bg], v_tmp[bg]) for bg in range(batch_size_actual)]
+                self.emit(valu=add_ops2)
+
+                for bg in range(batch_size_actual):
+                    g = batch_start + bg
+                    for vi in range(VLEN):
+                        i = g * VLEN + vi
+                        self.emit(debug=[("compare", v_idx[bg] + vi, (round, i, "next_idx"))])
+
+                # PHASE 6: Bounds check in parallel
+                cmp_ops = [("<", v_tmp[bg], v_idx[bg], v_n_nodes) for bg in range(batch_size_actual)]
+                self.emit(valu=cmp_ops)
+
+                mul_ops = [("*", v_idx[bg], v_idx[bg], v_tmp[bg]) for bg in range(batch_size_actual)]
+                self.emit(valu=mul_ops)
+
+                for bg in range(batch_size_actual):
+                    g = batch_start + bg
+                    for vi in range(VLEN):
+                        i = g * VLEN + vi
+                        self.emit(debug=[("compare", v_idx[bg] + vi, (round, i, "wrapped_idx"))])
+
+                # PHASE 7: Store ALL results in parallel
+                for bg in range(batch_size_actual):
+                    g = batch_start + bg
+                    self.emit(flow=[("add_imm", tmp_addr[bg], self.scratch["inp_indices_p"], g * VLEN)])
+                for bg in range(batch_size_actual):
+                    self.emit(store=[("vstore", tmp_addr[bg], v_idx[bg])])
+
+                for bg in range(batch_size_actual):
+                    g = batch_start + bg
+                    self.emit(flow=[("add_imm", tmp_addr[bg], self.scratch["inp_values_p"], g * VLEN)])
+                for bg in range(batch_size_actual):
+                    self.emit(store=[("vstore", tmp_addr[bg], v_val[bg])])
+
+        self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
 
