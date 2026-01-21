@@ -186,7 +186,7 @@ class KernelBuilder:
 
         body = []  # array of slots
         
-        UNROLL_FACTOR = 64  # Power of 2 for perfect alignment with batch_size=256
+        UNROLL_FACTOR = 64  # Optimal convergence point: 256/64 = 4 perfect batches
         
         # Allocate separate registers per unrolled iteration with minimal footprint
         tmp_regs = []
