@@ -74,9 +74,17 @@ class KernelBuilder:
                     reads.add(src1 + i)
                     reads.add(src2 + i)
                     writes.add(dest + i)
+            elif len(slot) == 5:
+                # multiply_add or other 4-arg valu ops
+                _, dest, a, b, c = slot
+                for i in range(VLEN):
+                    reads.add(a + i)
+                    reads.add(b + i)
+                    reads.add(c + i)
+                    writes.add(dest + i)
             else:
-                # Fallback for other valu ops
-                pass
+                # Unknown valu operation - raise error to aid debugging
+                raise NotImplementedError(f"Unknown valu op format: {slot}")
         elif engine == "load":
             if slot[0] == "const":
                 # ("const", dest, val) - only writes
@@ -214,7 +222,7 @@ class KernelBuilder:
         5. Keep indexed loads (node_val) scalar as they can't be vectorized
         6. Pre-broadcast constants outside loop to reduce redundant operations
         """
-        # Process 8 vector groups (64 elements) per iteration - best balance
+        # Process 8 vector groups (64 elements) per iteration - best balance without running out of scratch
         VEC_UNROLL = 8
         
         tmp1 = self.alloc_scratch("tmp1")
@@ -292,7 +300,7 @@ class KernelBuilder:
                 'addr': self.alloc_scratch(f"s_addr{s}"),
             })
         
-        # Number of vector groups = batch_size / VLEN = 256 / 8 = 32
+        # Number of vector groups = batch_size / VLEN
         n_vec_groups = batch_size // VLEN
         
         # Pre-allocate and broadcast common constants outside the loop
