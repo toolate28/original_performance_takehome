@@ -253,10 +253,8 @@ class KernelBuilder:
         num_vec_batches = batch_size // VLEN
         
         # Unroll across multiple vector batches to maximize parallelism
-        VEC_UNROLL = min(20, num_vec_batches)  # Unroll to fit in scratch space
-        
-        # Allocate shared resources
-        addr_gather_shared = [self.alloc_scratch(f"addr_gather_{i}") for i in range(VLEN)]
+        # With separate addr_gather per batch (73 regs/batch): max ~18 batches
+        VEC_UNROLL = min(18, num_vec_batches)
         
         # Allocate registers for VEC_UNROLL batches
         vec_regs = []
@@ -271,16 +269,10 @@ class KernelBuilder:
                 'vec_hash_tmp1': self.alloc_scratch(f"vec_hash_tmp1_{u}", VLEN),
                 'vec_hash_tmp2': self.alloc_scratch(f"vec_hash_tmp2_{u}", VLEN),
                 'addr_base': self.alloc_scratch(f"addr_base_{u}"),
-                'addr_gather': addr_gather_shared,  # Share gather addresses (read-only once written)
+                # Each batch gets its own gather addresses for parallel calculation
+                'addr_gather': [self.alloc_scratch(f"addr_gather_{u}_{i}") for i in range(VLEN)],
             }
             vec_regs.append(regs)
-        
-        # Shared constant vectors (broadcast once, reuse)
-        val1_vec = self.alloc_scratch("val1_vec", VLEN)
-        val3_vec = self.alloc_scratch("val3_vec", VLEN)
-        two_vec = self.alloc_scratch("two_vec", VLEN)
-        zero_vec = self.alloc_scratch("zero_vec", VLEN)
-        n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
         
         # Pre-broadcast all hash constants (one time setup)
         hash_val1_vecs = []
@@ -294,6 +286,9 @@ class KernelBuilder:
             hash_val3_vecs.append(val3_vec)
         
         # Broadcast other constants once (one-time setup)
+        two_vec = self.alloc_scratch("two_vec", VLEN)
+        zero_vec = self.alloc_scratch("zero_vec", VLEN)
+        n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
         body.append(("valu", ("vbroadcast", two_vec, two_const)))
         body.append(("valu", ("vbroadcast", zero_vec, zero_const)))
         body.append(("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])))
@@ -318,11 +313,21 @@ class KernelBuilder:
                     body.append(("alu", ("+", regs['addr_base'], self.scratch["inp_values_p"], self.scratch_const(i_base))))
                     body.append(("load", ("vload", regs['vec_val'], regs['addr_base'])))
                 
-                # Gather node values for all batches (interleaved by lane for better packing)
+                # CRITICAL OPTIMIZATION: Batch gather address calculations
+                # ALU limit = 12/cycle (not 2!), Load limit = 2/cycle
+                # Calculate ALL addresses first (12 at a time), then do ALL loads (2 at a time)
+                
+                # Phase 1: Calculate ALL gather addresses for ALL batches
+                # This will pack at 12 ALU ops/cycle instead of 1!
                 for lane in range(VLEN):
                     for u in range(num_batches):
                         regs = vec_regs[u]
                         body.append(("alu", ("+", regs['addr_gather'][lane], self.scratch["forest_values_p"], regs['vec_idx'] + lane)))
+                
+                # Phase 2: Perform ALL gather loads (2/cycle)
+                for lane in range(VLEN):
+                    for u in range(num_batches):
+                        regs = vec_regs[u]
                         body.append(("load", ("load", regs['vec_node_val'] + lane, regs['addr_gather'][lane])))
                 
                 # === COMPUTE PHASE (interleaved) ===
