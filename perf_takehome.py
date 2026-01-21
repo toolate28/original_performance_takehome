@@ -136,15 +136,27 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
+    def build_hash(self, val_hash_addr, tmp1_base, tmp2_base, round, i):
+        """Group hash operations by type for massive VLIW parallelism"""
         slots = []
-
+        
+        # Allocate separate temporaries per hash stage (6 stages)
+        hash_tmp1_addrs = [self.alloc_scratch(f"hash_tmp1_{round}_{i}_{hi}") for hi in range(6)]
+        hash_tmp2_addrs = [self.alloc_scratch(f"hash_tmp2_{round}_{i}_{hi}") for hi in range(6)]
+        
+        # Phase 1: All op1 operations (6 parallel, 12 ALU slots available)
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
+            slots.append(("alu", (op1, hash_tmp1_addrs[hi], val_hash_addr, self.scratch_const(val1))))
+        
+        # Phase 2: All op3 operations (6 parallel)
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            slots.append(("alu", (op3, hash_tmp2_addrs[hi], val_hash_addr, self.scratch_const(val3))))
+        
+        # Phase 3: All op2 operations (6 sequential due to dependencies on Phase 1&2)
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            slots.append(("alu", (op2, val_hash_addr, hash_tmp1_addrs[hi], hash_tmp2_addrs[hi])))
             slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
+        
         return slots
 
     def build_kernel(
@@ -306,11 +318,11 @@ class KernelBuilder:
                     i = i_base + u
                     tr = tmp_regs[u]
                     body.append(("alu", ("==", tr['tmp1'], tr['tmp1'], zero_const)))
-                # Batch selects
+                # Batch arithmetic selects (2 - condition: if condition=1 then 1, if condition=0 then 2)
                 for u in range(num_iterations):
                     i = i_base + u
                     tr = tmp_regs[u]
-                    body.append(("flow", ("select", tr['tmp3'], tr['tmp1'], one_const, two_const)))
+                    body.append(("alu", ("-", tr['tmp3'], two_const, tr['tmp1'])))
                 # Batch multiplications
                 for u in range(num_iterations):
                     i = i_base + u
