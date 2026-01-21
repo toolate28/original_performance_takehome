@@ -271,7 +271,7 @@ class KernelBuilder:
 
         # Process VLEN elements at a time with vector unrolling
         vec_batch_size = batch_size // VLEN
-        VEC_UNROLL = 16  # Process 16 vector blocks per iteration
+        VEC_UNROLL = 8  # Optimal: balances register pressure, chunking overhead, and VLIW packing
         
         # Allocate vector registers for unrolled vector iterations
         v_regs = []
@@ -388,15 +388,17 @@ class KernelBuilder:
             
             # Now process all rounds for this batch chunk
             for round in range(rounds):
-                # Stage 2: Load node values (scalar loads - batch all address calculations, then all loads)
-                for u in range(num_vec_unrolled):
-                    vr = v_regs[u]
-                    for vi in range(VLEN):
+                # Stage 2: Load node values - INTERLEAVE address calc and load for better pipelining
+                # Interleave at the finest granularity to maximize load slot utilization
+                for vi in range(VLEN):
+                    # Calculate addresses for all unroll iterations for this element
+                    for u in range(num_vec_unrolled):
+                        vr = v_regs[u]
                         at = addr_tmp[u][vi]
                         body.append(("alu", ("+", at, self.scratch["forest_values_p"], vr['idx'] + vi)))
-                for u in range(num_vec_unrolled):
-                    vr = v_regs[u]
-                    for vi in range(VLEN):
+                    # Then load for all unroll iterations for this element
+                    for u in range(num_vec_unrolled):
+                        vr = v_regs[u]
                         at = addr_tmp[u][vi]
                         body.append(("load", ("load", vr['node_val'] + vi, at)))
                 
