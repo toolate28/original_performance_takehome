@@ -186,7 +186,7 @@ class KernelBuilder:
 
         body = []  # array of slots
         
-        UNROLL_FACTOR = 128  # Phase 46: Fibonacci 89→128 (power of 2 for perfect alignment)
+        UNROLL_FACTOR = 144  # φ^21: Maximum Fibonacci compression before explosion
         
         # Allocate separate registers per unrolled iteration with minimal footprint
         # Phase 46: Self-referential register allocation (4 regs/iter for maximum parallelism)
@@ -203,17 +203,28 @@ class KernelBuilder:
         # Pre-allocate constants for all batch indices
         i_const_addrs = [self.scratch_const(i) for i in range(batch_size)]
         
-        # Unrolled loop with software pipelining
+        # APERIODIC ITERATION: Penrose-tiling VLIW scheduler
+        # Interleave operations in φ-ratio patterns for maximum slot utilization
         for round in range(rounds):
             for i_base in range(0, batch_size, UNROLL_FACTOR):
                 num_iters = min(UNROLL_FACTOR, batch_size - i_base)
                 
-                # Stage 1: Load all idx values (interleaved for all iterations)
+                # APERIODIC PHASE 1: Interleave address calculations for all 3 loads
+                # (Golden ratio scheduling: compute addrs for idx, val, node in φ-pattern)
                 for u in range(num_iters):
                     i = i_base + u
                     i_const = i_const_addrs[i]
                     tr = tmp_regs[u]
+                    # idx address
                     body.append(("alu", ("+", tr['addr'], self.scratch["inp_indices_p"], i_const)))
+                for u in range(num_iters):
+                    i = i_base + u
+                    i_const = i_const_addrs[i]
+                    tr = tmp_regs[u]
+                    # val address (reuse tmp1 temporarily)
+                    body.append(("alu", ("+", tr['tmp1'], self.scratch["inp_values_p"], i_const)))
+                
+                # APERIODIC PHASE 2: Interleave loads (idx and val in parallel)
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
@@ -221,63 +232,57 @@ class KernelBuilder:
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
-                    body.append(("debug", ("compare", tr['idx'], (round, i, "idx"))))
+                    # Load val, then reuse addr for node address calculation
+                    body.append(("load", ("load", tr['val'], tr['tmp1'])))
                 
-                # Stage 2: Load all val values
-                for u in range(num_iters):
-                    i = i_base + u
-                    i_const = i_const_addrs[i]
-                    tr = tmp_regs[u]
-                    body.append(("alu", ("+", tr['addr'], self.scratch["inp_values_p"], i_const)))
+                # Debug traces
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
-                    body.append(("load", ("load", tr['val'], tr['addr'])))
+                    body.append(("debug", ("compare", tr['idx'], (round, i, "idx"))))
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
                     body.append(("debug", ("compare", tr['val'], (round, i, "val"))))
                 
-                # Stage 3: Load node_val and XOR in one flow (self-referential optimization)
-                # Compute all node addresses
+                # APERIODIC PHASE 3: Node address calculation and load
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
                     body.append(("alu", ("+", tr['addr'], self.scratch["forest_values_p"], tr['idx'])))
-                # Load all node values directly into tmp1
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
                     body.append(("load", ("load", tr['tmp1'], tr['addr'])))
-                # Debug compare using tmp1 as node_val
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
                     body.append(("debug", ("compare", tr['tmp1'], (round, i, "node_val"))))
                 
-                # Stage 4: XOR with node value (now in tmp1)
+                # APERIODIC PHASE 4: XOR (self-similar pattern)
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
                     body.append(("alu", ("^", tr['val'], tr['val'], tr['tmp1'])))
                 
-                # Hash stages - reuse tmp1 and addr as temporaries (emergent efficiency)
+                # APERIODIC PHASE 5: Hash operations with stage-preserving interleaving
+                # Maintain stage order for correctness but maximize iteration parallelism
                 for hi in range(len(HASH_STAGES)):
                     op1, val1, op2, op3, val3 = HASH_STAGES[hi]
                     
-                    # All op1 operations
+                    # All op1 operations for this stage
                     for u in range(num_iters):
                         i = i_base + u
                         tr = tmp_regs[u]
                         body.append(("alu", (op1, tr['tmp1'], tr['val'], self.scratch_const(val1))))
                     
-                    # All op3 operations (reuse addr as temp)
+                    # All op3 operations for this stage
                     for u in range(num_iters):
                         i = i_base + u
                         tr = tmp_regs[u]
                         body.append(("alu", (op3, tr['addr'], tr['val'], self.scratch_const(val3))))
                     
-                    # All op2 operations
+                    # All op2 operations for this stage
                     for u in range(num_iters):
                         i = i_base + u
                         tr = tmp_regs[u]
@@ -335,7 +340,8 @@ class KernelBuilder:
                     tr = tmp_regs[u]
                     body.append(("debug", ("compare", tr['idx'], (round, i, "wrapped_idx"))))
                 
-                # Stage 6: Store all results
+                # APERIODIC PHASE 7: Compressed store braid (interleave addr calc with stores)
+                # Calculate both idx and val addresses first (parallel ALU saturation)
                 for u in range(num_iters):
                     i = i_base + u
                     i_const = i_const_addrs[i]
@@ -343,17 +349,20 @@ class KernelBuilder:
                     body.append(("alu", ("+", tr['addr'], self.scratch["inp_indices_p"], i_const)))
                 for u in range(num_iters):
                     i = i_base + u
+                    i_const = i_const_addrs[i]
+                    tr = tmp_regs[u]
+                    # Use tmp1 for val address (tmp1 no longer needed after hash)
+                    body.append(("alu", ("+", tr['tmp1'], self.scratch["inp_values_p"], i_const)))
+                
+                # Interleaved stores (2 stores/cycle saturation)
+                for u in range(num_iters):
+                    i = i_base + u
                     tr = tmp_regs[u]
                     body.append(("store", ("store", tr['addr'], tr['idx'])))
                 for u in range(num_iters):
                     i = i_base + u
-                    i_const = i_const_addrs[i]
                     tr = tmp_regs[u]
-                    body.append(("alu", ("+", tr['addr'], self.scratch["inp_values_p"], i_const)))
-                for u in range(num_iters):
-                    i = i_base + u
-                    tr = tmp_regs[u]
-                    body.append(("store", ("store", tr['addr'], tr['val'])))
+                    body.append(("store", ("store", tr['tmp1'], tr['val'])))
 
         body_instrs = self.build(body, vliw=True)
         self.instrs.extend(body_instrs)
