@@ -85,6 +85,11 @@ class KernelBuilder:
                 # ("load", dest, addr)
                 writes.add(slot[1])
                 reads.add(slot[2])
+            elif slot[0] == "load_offset":
+                # ("load_offset", dest, addr, offset) - writes to dest+offset
+                _, dest, addr, offset = slot
+                writes.add(dest + offset)
+                reads.add(addr + offset)
             elif slot[0] == "vload":
                 # ("vload", dest, addr) - loads VLEN elements
                 _, dest, addr = slot
@@ -205,12 +210,12 @@ class KernelBuilder:
         1. Process 8 elements at once using VLEN=8 vector operations
         2. Use vload/vstore for contiguous memory access (indices and values)
         3. Use valu for vectorizable operations (XOR, hash arithmetic)
-        4. Unroll by 6 vector groups to maximize valu utilization (6 slots available)
+        4. Unroll by 4 vector groups for better load slot utilization
         5. Keep indexed loads (node_val) scalar as they can't be vectorized
         6. Pre-broadcast constants outside loop to reduce redundant operations
         """
-        # Process 6 vector groups (48 elements) per iteration to maximize 6 valu slots
-        VEC_UNROLL = 6
+        # Process 8 vector groups (64 elements) per iteration - best balance
+        VEC_UNROLL = 8
         
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -280,11 +285,10 @@ class KernelBuilder:
             })
         
         # Allocate scalar registers for the indexed loads (can't vectorize)
-        # We only need nval and addr now since we access idx_vec directly
+        # We only need addr now since we use load_offset to write directly to vector
         scalar_regs = []
         for s in range(VLEN * VEC_UNROLL):
             scalar_regs.append({
-                'nval': self.alloc_scratch(f"s_nval{s}"),
                 'addr': self.alloc_scratch(f"s_addr{s}"),
             })
         
@@ -363,19 +367,14 @@ class KernelBuilder:
                         sr = scalar_regs[u * VLEN + vi]
                         body.append(("alu", ("+", sr['addr'], self.scratch["forest_values_p"], vr['idx_vec'] + vi)))
                 
-                # Load node values
-                for u in range(n):
-                    for vi in range(VLEN):
-                        sr = scalar_regs[u * VLEN + vi]
-                        body.append(("load", ("load", sr['nval'], sr['addr'])))
-                
-                # PHASE 4: Vector XOR - copy nval to t1_vec, then XOR with val_vec
+                # Load node values directly into t1_vec (no intermediate scalar register)
                 for u in range(n):
                     vr = vregs[u]
                     for vi in range(VLEN):
                         sr = scalar_regs[u * VLEN + vi]
-                        body.append(("alu", ("+", vr['t1_vec'] + vi, sr['nval'], zero_const)))
+                        body.append(("load", ("load", vr['t1_vec'] + vi, sr['addr'])))
                 
+                # PHASE 4: Vector XOR - t1_vec now contains nval, XOR with val_vec
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], vr['t1_vec'])))
