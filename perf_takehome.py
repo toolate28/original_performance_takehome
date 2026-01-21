@@ -370,17 +370,17 @@ class KernelBuilder:
                 else:
                     # Late rounds: use gather (fallback to original)
                     # Phase 1: Calculate ALL gather addresses for ALL batches
-                # This will pack at 12 ALU ops/cycle instead of 1!
-                for lane in range(VLEN):
-                    for u in range(num_batches):
-                        regs = vec_regs[u]
-                        body.append(("alu", ("+", regs['addr_gather'][lane], self.scratch["forest_values_p"], regs['vec_idx'] + lane)))
-                
-                # Phase 2: Perform ALL gather loads (2/cycle)
-                for lane in range(VLEN):
-                    for u in range(num_batches):
-                        regs = vec_regs[u]
-                        body.append(("load", ("load", regs['vec_node_val'] + lane, regs['addr_gather'][lane])))
+                    # This will pack at 12 ALU ops/cycle instead of 1!
+                    for lane in range(VLEN):
+                        for u in range(num_batches):
+                            regs = vec_regs[u]
+                            body.append(("alu", ("+", regs['addr_gather'][lane], self.scratch["forest_values_p"], regs['vec_idx'] + lane)))
+                    
+                    # Phase 2: Perform ALL gather loads (2/cycle)
+                    for lane in range(VLEN):
+                        for u in range(num_batches):
+                            regs = vec_regs[u]
+                            body.append(("load", ("load", regs['vec_node_val'] + lane, regs['addr_gather'][lane])))
                 
                 # === COMPUTE PHASE (interleaved) ===
                 # XOR all batches
