@@ -244,6 +244,7 @@ class KernelBuilder:
 
         # Unroll factor - process this many elements at a time
         # With 12 ALU slots, we can do more operations in parallel
+        # 16 seems optimal - higher values cause more register pressure
         UNROLL = 16
 
         # Allocate separate scratch registers for each unrolled iteration
@@ -253,6 +254,11 @@ class KernelBuilder:
         tmp_addr = [self.alloc_scratch(f"tmp_addr{u}") for u in range(UNROLL)]
         hash_tmp1 = [self.alloc_scratch(f"hash_tmp1_{u}") for u in range(UNROLL)]
         hash_tmp2 = [self.alloc_scratch(f"hash_tmp2_{u}") for u in range(UNROLL)]
+
+        # Allocate separate temporaries for index calculation to avoid dependencies
+        idx_tmp1 = [self.alloc_scratch(f"idx_tmp1_{u}") for u in range(UNROLL)]
+        idx_tmp2 = [self.alloc_scratch(f"idx_tmp2_{u}") for u in range(UNROLL)]
+        idx_tmp3 = [self.alloc_scratch(f"idx_tmp3_{u}") for u in range(UNROLL)]
 
         for round in range(rounds):
             for base_i in range(0, batch_size, UNROLL):
@@ -294,38 +300,59 @@ class KernelBuilder:
                 for u in range(UNROLL):
                     body.append(("alu", ("^", tmp_val[u], tmp_val[u], tmp_node_val[u])))
 
-                # Phase 4b: Hash all elements - reorganize to expose parallelism
-                # Interleave op1 and op3 since they're independent
+                # Phase 4b: Hash all elements - maximize parallelism by doing each operation
+                # type across all elements before moving to next operation
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     val1_const = self.scratch_const(val1)
                     val3_const = self.scratch_const(val3)
 
-                    # Interleave op1 and op3 to pack them together (both read from tmp_val)
+                    # Do all op1 operations
                     for u in range(UNROLL):
                         body.append(("alu", (op1, hash_tmp1[u], tmp_val[u], val1_const)))
+
+                    # Do all op3 operations (can pack with op1 since they use different dests)
+                    for u in range(UNROLL):
                         body.append(("alu", (op3, hash_tmp2[u], tmp_val[u], val3_const)))
 
-                    # Do op2 for all elements
+                    # Do all op2 operations
+                    for u in range(UNROLL):
+                        body.append(("alu", (op2, tmp_val[u], hash_tmp1[u], hash_tmp2[u])))
+
+                    # Add debug ops
                     for u in range(UNROLL):
                         i = base_i + u
-                        body.append(("alu", (op2, tmp_val[u], hash_tmp1[u], hash_tmp2[u])))
                         body.append(("debug", ("compare", tmp_val[u], (round, i, "hash_stage", hi))))
 
                 for u in range(UNROLL):
                     i = base_i + u
                     body.append(("debug", ("compare", tmp_val[u], (round, i, "hashed_val"))))
 
-                # Phase 5: Calculate next indices
+                # Phase 5: Calculate next indices - use separate temporaries to expose parallelism
+                # Subphase 5a: Calculate modulo (0 or 1)
+                for u in range(UNROLL):
+                    body.append(("alu", ("%", idx_tmp1[u], tmp_val[u], two_const)))
+
+                # Subphase 5b: Compute 1 + (val % 2) to get 1 or 2, multiply idx by 2
+                # This eliminates the flow operation! 1 + 1 = 2, 1 + 0 = 1
+                for u in range(UNROLL):
+                    body.append(("alu", ("+", idx_tmp3[u], one_const, idx_tmp1[u])))
+                for u in range(UNROLL):
+                    body.append(("alu", ("*", idx_tmp2[u], tmp_idx[u], two_const)))
+
+                # Subphase 5c: Add and debug next_idx
+                for u in range(UNROLL):
+                    body.append(("alu", ("+", tmp_idx[u], idx_tmp2[u], idx_tmp3[u])))
                 for u in range(UNROLL):
                     i = base_i + u
-                    body.append(("alu", ("%", tmp1, tmp_val[u], two_const)))
-                    body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                    body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                    body.append(("alu", ("*", tmp_idx[u], tmp_idx[u], two_const)))
-                    body.append(("alu", ("+", tmp_idx[u], tmp_idx[u], tmp3)))
                     body.append(("debug", ("compare", tmp_idx[u], (round, i, "next_idx"))))
-                    body.append(("alu", ("<", tmp1, tmp_idx[u], self.scratch["n_nodes"])))
-                    body.append(("flow", ("select", tmp_idx[u], tmp1, tmp_idx[u], zero_const)))
+
+                # Subphase 5d: Check bounds and wrap
+                for u in range(UNROLL):
+                    body.append(("alu", ("<", idx_tmp1[u], tmp_idx[u], self.scratch["n_nodes"])))
+                for u in range(UNROLL):
+                    body.append(("flow", ("select", tmp_idx[u], idx_tmp1[u], tmp_idx[u], zero_const)))
+                for u in range(UNROLL):
+                    i = base_i + u
                     body.append(("debug", ("compare", tmp_idx[u], (round, i, "wrapped_idx"))))
 
                 # Phase 6: Store results (can be parallelized)
