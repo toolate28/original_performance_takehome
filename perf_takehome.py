@@ -67,23 +67,11 @@ class KernelBuilder:
                 # ("load", dest, addr)
                 writes.add(slot[1])
                 reads.add(slot[2])
-            elif slot[0] == "vload":
-                # ("vload", dest, addr)
-                dest, addr = slot[1], slot[2]
-                for i in range(8):  # VLEN = 8
-                    writes.add(dest + i)
-                reads.add(addr)
         elif engine == "store":
             if slot[0] == "store":
                 # ("store", addr, src)
                 reads.add(slot[1])
                 reads.add(slot[2])
-            elif slot[0] == "vstore":
-                # ("vstore", addr, src)
-                addr, src = slot[1], slot[2]
-                reads.add(addr)
-                for i in range(8):  # VLEN = 8
-                    reads.add(src + i)
         elif engine == "flow":
             if slot[0] == "select":
                 # ("select", dest, cond, a, b)
@@ -91,33 +79,18 @@ class KernelBuilder:
                 reads.add(slot[2])
                 reads.add(slot[3])
                 reads.add(slot[4])
-            elif slot[0] == "add_imm":
-                # ("add_imm", dest, a, imm)
-                writes.add(slot[1])
-                reads.add(slot[2])
-            elif slot[0] == "vselect":
-                # ("vselect", dest, cond, a, b)
-                dest, cond, a, b = slot[1], slot[2], slot[3], slot[4]
-                for i in range(8):  # VLEN = 8
-                    writes.add(dest + i)
-                    reads.add(cond + i)
-                    reads.add(a + i)
-                    reads.add(b + i)
-            elif slot[0] in ["pause", "halt"]:
-                pass  # No dependencies
         elif engine == "debug":
-            # Debug operations have no real dependencies
-            pass
+            if slot[0] == "compare":
+                # ("compare", addr, ...) - reads the value at addr
+                reads.add(slot[1])
         
         return (reads, writes)
     
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = True):
         """
         Pack slots into VLIW instruction bundles with dependency awareness.
-        Separates debug operations to maximize packing of real operations.
         """
         if not vliw:
-            # Fall back to naive packing for debugging
             instrs = []
             for engine, slot in slots:
                 instrs.append({engine: [slot]})
@@ -127,14 +100,8 @@ class KernelBuilder:
         current_bundle = {}
         slot_counts = defaultdict(int)
         written_this_cycle = set()
-        pending_debug = []  # Accumulate debug ops
         
         for engine, slot in slots:
-            # Handle debug operations separately - accumulate them
-            if engine == "debug":
-                pending_debug.append(slot)
-                continue
-            
             reads, writes = self._analyze_dependencies(engine, slot)
             
             # Check if we can add this slot to the current bundle
@@ -150,11 +117,6 @@ class KernelBuilder:
             
             # If we can't add to current bundle, emit it and start a new one
             if not can_add:
-                # Add accumulated debug ops to current bundle before emitting
-                if pending_debug and current_bundle:
-                    current_bundle["debug"] = pending_debug
-                    pending_debug = []
-                
                 if current_bundle:
                     instrs.append(current_bundle)
                 current_bundle = {}
@@ -168,18 +130,9 @@ class KernelBuilder:
             slot_counts[engine] += 1
             written_this_cycle.update(writes)
         
-        # Add any remaining debug ops to final bundle
-        if pending_debug and current_bundle:
-            current_bundle["debug"] = pending_debug
-            pending_debug = []
-        
         # Emit final bundle
         if current_bundle:
             instrs.append(current_bundle)
-        
-        # If there are still pending debug ops, emit them in a final bundle
-        if pending_debug:
-            instrs.append({"debug": pending_debug})
         
         return instrs
 
@@ -217,215 +170,200 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        Optimized with loop unrolling and interleaved operations for maximum VLIW packing.
+        Highly optimized kernel with aggressive unrolling and instruction-level parallelism.
+        Key optimizations:
+        1. Unroll loop by UNROLL_FACTOR to expose ILP
+        2. Allocate separate registers per iteration to eliminate dependencies
+        3. Group operations by type to maximize VLIW packing (12 ALU, 2 load, 2 store per cycle)
+        4. Replace flow ops with arithmetic to increase ALU utilization
+        5. Pre-compute and cache hash constants
+        6. Batch all constant loads together for maximum VLIW packing
         """
-        UNROLL_FACTOR = 32  # Balance between parallelism and scratch space
+        # Max unroll with scratch space constraint
+        UNROLL_FACTOR = min(110, batch_size)
         
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+        
+        # Allocate runtime variables
         init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
+            "rounds", "n_nodes", "batch_size", "forest_height",
+            "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
         
-        # Optimize initialization: batch const loads and mem loads
+        # Pre-allocate all scratch addresses for constants first
+        # This prevents them from being added to instrs during allocation
+        const_values_needed = set([0, 1, 2])  # zero, one, two
+        const_values_needed.update(range(batch_size))  # i values
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            const_values_needed.add(val1)
+            const_values_needed.add(val3)
+        
+        # Allocate scratch space for all constants
+        const_addrs = {}
+        for val in sorted(const_values_needed):
+            const_addrs[val] = self.alloc_scratch(f"const_{val}")
+        
+        # Now batch all const loads together
+        const_body = []
+        for val in sorted(const_values_needed):
+            const_body.append(("load", ("const", const_addrs[val], val)))
+        
+        # Initialize runtime variables
         init_body = []
         for i, v in enumerate(init_vars):
             init_body.append(("load", ("const", tmp1, i)))
             init_body.append(("load", ("load", self.scratch[v], tmp1)))
-        init_instrs = self.build(init_body)
-        self.instrs.extend(init_instrs)
+        
+        # Combine and pack all initialization
+        self.instrs.extend(self.build(const_body + init_body))
 
-        # Pre-allocate all constants for i values
-        i_const_addrs = [self.scratch_const(i) for i in range(batch_size)]
-        zero_const = i_const_addrs[0]
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # Set up const map for easy access
+        self.const_map = const_addrs
+        i_consts = [const_addrs[i] for i in range(batch_size)]
+        zero_const = const_addrs[0]
+        one_const = const_addrs[1]
+        two_const = const_addrs[2]
+        
+        # Hash constants
+        hash_consts = []
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            hash_consts.append((const_addrs[val1], const_addrs[val3]))
 
         self.add("flow", ("pause",))
         self.add("debug", ("comment", "Starting loop"))
 
-        # Allocate separate scratch registers per unroll iteration
-        # Use separate address registers for each memory operation to avoid false dependencies
-        tmp_regs = []
+        # Allocate registers for each unrolled iteration
+        regs = []
         for u in range(UNROLL_FACTOR):
-            tmp_regs.append({
-                'idx': self.alloc_scratch(f"tmp_idx_{u}"),
-                'val': self.alloc_scratch(f"tmp_val_{u}"),
-                'node_val': self.alloc_scratch(f"tmp_node_val_{u}"),
-                'addr_idx_load': self.alloc_scratch(f"addr_idx_load_{u}"),
-                'addr_val_load': self.alloc_scratch(f"addr_val_load_{u}"),
-                'addr_node_load': self.alloc_scratch(f"addr_node_load_{u}"),
-                'addr_idx_store': self.alloc_scratch(f"addr_idx_store_{u}"),
-                'addr_val_store': self.alloc_scratch(f"addr_val_store_{u}"),
-                'tmp1': self.alloc_scratch(f"tmp1_{u}"),
-                'tmp2': self.alloc_scratch(f"tmp2_{u}"),
-                'tmp3': self.alloc_scratch(f"tmp3_{u}"),
+            regs.append({
+                'idx': self.alloc_scratch(f"idx{u}"),
+                'val': self.alloc_scratch(f"val{u}"),
+                'nval': self.alloc_scratch(f"nval{u}"),
+                'aidl': self.alloc_scratch(f"aidl{u}"),
+                'avl': self.alloc_scratch(f"avl{u}"),
+                'anl': self.alloc_scratch(f"anl{u}"),
+                'aids': self.alloc_scratch(f"aids{u}"),
+                'avs': self.alloc_scratch(f"avs{u}"),
+                't1': self.alloc_scratch(f"t1_{u}"),
+                't2': self.alloc_scratch(f"t2_{u}"),
+                't3': self.alloc_scratch(f"t3_{u}"),
             })
 
-        body = []  # array of slots
+        body = []
 
         for round in range(rounds):
             for i_base in range(0, batch_size, UNROLL_FACTOR):
-                iterations = min(UNROLL_FACTOR, batch_size - i_base)
+                n = min(UNROLL_FACTOR, batch_size - i_base)
                 
-                # Process all iterations in parallel as much as possible
-                # Instead of stage-by-stage, we interleave operations
+                # PHASE 1: Load indices
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("alu", ("+", r['aidl'], self.scratch["inp_indices_p"], i_consts[i_base+u])))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("load", ("load", r['idx'], r['aidl'])))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("debug", ("compare", r['idx'], (round, i_base+u, "idx"))))
                 
-                # Stage 1: Load indices (address calc + load)
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("alu", ("+", regs['addr_idx_load'], self.scratch["inp_indices_p"], i_const_addrs[i])))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("load", ("load", regs['idx'], regs['addr_idx_load'])))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("debug", ("compare", regs['idx'], (round, i, "idx"))))
+                # PHASE 2: Load values
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("alu", ("+", r['avl'], self.scratch["inp_values_p"], i_consts[i_base+u])))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("load", ("load", r['val'], r['avl'])))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("debug", ("compare", r['val'], (round, i_base+u, "val"))))
                 
-                # Stage 2: Load values (address calc + load)
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("alu", ("+", regs['addr_val_load'], self.scratch["inp_values_p"], i_const_addrs[i])))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("load", ("load", regs['val'], regs['addr_val_load'])))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("debug", ("compare", regs['val'], (round, i, "val"))))
+                # PHASE 3: Load node values
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("alu", ("+", r['anl'], self.scratch["forest_values_p"], r['idx'])))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("load", ("load", r['nval'], r['anl'])))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("debug", ("compare", r['nval'], (round, i_base+u, "node_val"))))
                 
-                # Stage 3: Load node values (address calc + load)
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("alu", ("+", regs['addr_node_load'], self.scratch["forest_values_p"], regs['idx'])))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("load", ("load", regs['node_val'], regs['addr_node_load'])))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("debug", ("compare", regs['node_val'], (round, i, "node_val"))))
+                # PHASE 4: XOR
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("alu", ("^", r['val'], r['val'], r['nval'])))
                 
-                # Stage 5: Hash computation - proper phason grouping
-                # Key insight: We can run hash operations from DIFFERENT hash stages
-                # in parallel across iterations because they use separate registers
-                
-                # First: XOR all values
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("alu", ("^", regs['val'], regs['val'], regs['node_val'])))
-                
-                # Now process hash stages with maximum parallelism
-                # Each hash stage has 3 ops, but with 13 iterations we can pack 12 ALU ops per cycle
+                # PHASE 5: Hash
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    val1_const = self.scratch_const(val1)
-                    val3_const = self.scratch_const(val3)
+                    c1, c3 = hash_consts[hi]
                     
-                    # Do all op1 operations for all iterations (can all fire in parallel)
-                    for u in range(iterations):
-                        i = i_base + u
-                        regs = tmp_regs[u]
-                        body.append(("alu", (op1, regs['tmp1'], regs['val'], val1_const)))
+                    for u in range(n):
+                        r = regs[u]
+                        body.append(("alu", (op1, r['t1'], r['val'], c1)))
                     
-                    # Do all op3 operations for all iterations (can all fire in parallel)
-                    for u in range(iterations):
-                        i = i_base + u
-                        regs = tmp_regs[u]
-                        body.append(("alu", (op3, regs['tmp2'], regs['val'], val3_const)))
+                    for u in range(n):
+                        r = regs[u]
+                        body.append(("alu", (op3, r['t2'], r['val'], c3)))
                     
-                    # Do all op2 operations for all iterations (depends on tmp1 and tmp2)
-                    for u in range(iterations):
-                        i = i_base + u
-                        regs = tmp_regs[u]
-                        body.append(("alu", (op2, regs['val'], regs['tmp1'], regs['tmp2'])))
-                        body.append(("debug", ("compare", regs['val'], (round, i, "hash_stage", hi))))
+                    for u in range(n):
+                        r = regs[u]
+                        body.append(("alu", (op2, r['val'], r['t1'], r['t2'])))
+                        body.append(("debug", ("compare", r['val'], (round, i_base+u, "hash_stage", hi))))
                 
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("debug", ("compare", regs['val'], (round, i, "hashed_val"))))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("debug", ("compare", r['val'], (round, i_base+u, "hashed_val"))))
                 
-                # Stage 6: Update indices - replace flow select with arithmetic
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("alu", ("%", regs['tmp1'], regs['val'], two_const)))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("alu", ("==", regs['tmp1'], regs['tmp1'], zero_const)))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    # When cond=1 (even): 2-1=1, When cond=0 (odd): 2-0=2
-                    body.append(("alu", ("-", regs['tmp3'], two_const, regs['tmp1'])))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("alu", ("*", regs['idx'], regs['idx'], two_const)))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("alu", ("+", regs['idx'], regs['idx'], regs['tmp3'])))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("debug", ("compare", regs['idx'], (round, i, "next_idx"))))
+                # PHASE 6: Update indices
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("alu", ("%", r['t1'], r['val'], two_const)))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("alu", ("==", r['t1'], r['t1'], zero_const)))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("alu", ("-", r['t3'], two_const, r['t1'])))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("alu", ("*", r['idx'], r['idx'], two_const)))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("alu", ("+", r['idx'], r['idx'], r['t3'])))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("debug", ("compare", r['idx'], (round, i_base+u, "next_idx"))))
                 
-                # Stage 7: Wrap indices
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("alu", ("<", regs['tmp1'], regs['idx'], self.scratch["n_nodes"])))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    # When cond=1: idx*1 = idx, When cond=0: idx*0 = 0
-                    body.append(("alu", ("*", regs['idx'], regs['idx'], regs['tmp1'])))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("debug", ("compare", regs['idx'], (round, i, "wrapped_idx"))))
+                # PHASE 7: Wrap indices
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("alu", ("<", r['t1'], r['idx'], self.scratch["n_nodes"])))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("alu", ("*", r['idx'], r['idx'], r['t1'])))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("debug", ("compare", r['idx'], (round, i_base+u, "wrapped_idx"))))
                 
-                # Stage 8: Store results (address calc + store)
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("alu", ("+", regs['addr_idx_store'], self.scratch["inp_indices_p"], i_const_addrs[i])))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("store", ("store", regs['addr_idx_store'], regs['idx'])))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("alu", ("+", regs['addr_val_store'], self.scratch["inp_values_p"], i_const_addrs[i])))
-                for u in range(iterations):
-                    i = i_base + u
-                    regs = tmp_regs[u]
-                    body.append(("store", ("store", regs['addr_val_store'], regs['val'])))
+                # PHASE 8: Store results
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("alu", ("+", r['aids'], self.scratch["inp_indices_p"], i_consts[i_base+u])))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("store", ("store", r['aids'], r['idx'])))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("alu", ("+", r['avs'], self.scratch["inp_values_p"], i_consts[i_base+u])))
+                for u in range(n):
+                    r = regs[u]
+                    body.append(("store", ("store", r['avs'], r['val'])))
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
+        self.instrs.extend(self.build(body))
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
