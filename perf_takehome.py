@@ -199,7 +199,7 @@ class KernelBuilder:
 
         body = []  # array of slots
 
-        UNROLL_FACTOR = 13
+        UNROLL_FACTOR = 32  # Optimal unroll factor
         
         # Pre-compute all index constants before the main loop
         i_consts = []
