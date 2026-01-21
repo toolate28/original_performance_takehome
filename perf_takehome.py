@@ -45,11 +45,76 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]]):
-        # Simple slot packing that just uses one slot per instruction bundle
+    def _analyze_dependencies(self, engine: str, slot: tuple):
+        """Extract read/write registers from instruction slot"""
+        reads = set()
+        writes = set()
+        
+        if engine == "alu":
+            op, dest, src1, src2 = slot
+            writes.add(dest)
+            reads.update([src1, src2])
+        elif engine == "load":
+            if slot[0] == "load":
+                _, dest, addr = slot
+                writes.add(dest)
+                reads.add(addr)
+            elif slot[0] == "const":
+                _, dest, _ = slot
+                writes.add(dest)
+        elif engine == "store":
+            _, addr, val = slot
+            reads.update([addr, val])
+        elif engine == "flow":
+            if slot[0] == "select":
+                _, dest, cond, a, b = slot
+                writes.add(dest)
+                reads.update([cond, a, b])
+            elif slot[0] == "pause":
+                # No dependencies
+                pass
+        elif engine == "debug":
+            # Debug instructions read from registers
+            if slot[0] == "compare":
+                _, reg, _ = slot
+                reads.add(reg)
+        
+        return reads, writes
+
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = True):
+        """Dependency-aware VLIW bundling with RAW hazard detection"""
+        if not vliw:
+            return [{engine: [slot]} for engine, slot in slots]
+        
         instrs = []
+        current_bundle = {}
+        slot_counts = {engine: 0 for engine in SLOT_LIMITS}
+        written_this_cycle = set()
+        
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            reads, writes = self._analyze_dependencies(engine, slot)
+            
+            # Can add if: slot available AND no RAW hazard
+            has_raw_hazard = bool(reads & written_this_cycle)
+            slot_available = slot_counts[engine] < SLOT_LIMITS[engine]
+            
+            if has_raw_hazard or not slot_available:
+                # Flush current bundle, start new cycle
+                if current_bundle:
+                    instrs.append(current_bundle)
+                current_bundle = {}
+                slot_counts = {engine: 0 for engine in SLOT_LIMITS}
+                written_this_cycle = set()
+            
+            # Add to current bundle
+            if engine not in current_bundle:
+                current_bundle[engine] = []
+            current_bundle[engine].append(slot)
+            slot_counts[engine] += 1
+            written_this_cycle.update(writes)
+        
+        if current_bundle:
+            instrs.append(current_bundle)
         return instrs
 
     def add(self, engine, slot):
@@ -165,7 +230,7 @@ class KernelBuilder:
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
                 body.append(("store", ("store", tmp_addr, tmp_val)))
 
-        body_instrs = self.build(body)
+        body_instrs = self.build(body)  # Use VLIW bundling
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
