@@ -82,6 +82,22 @@ class KernelBuilder:
             elif slot[0] == "add_imm":
                 writes.add(slot[1])
                 reads.add(slot[2])
+        elif engine == "valu":
+            if slot[0] == "vbroadcast":
+                _, dest, src = slot
+                for i in range(8):  # VLEN=8
+                    writes.add(dest + i)
+                reads.add(src)
+            elif slot[0] == "multiply_add":
+                _, dest, a, b, c = slot
+                for i in range(8):
+                    writes.add(dest + i)
+                    reads.update([a + i, b + i, c + i])
+            else:  # Generic valu ops (op, dest, a1, a2)
+                _, dest, a1, a2 = slot
+                for i in range(8):
+                    writes.add(dest + i)
+                    reads.update([a1 + i, a2 + i])
         elif engine == "debug":
             if slot[0] == "compare":
                 reads.add(slot[1])
