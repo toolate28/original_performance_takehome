@@ -45,7 +45,7 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = True):
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
         """
         Quasicrystal aperiodic VLIW packing with dependency tracking.
         Pack multiple independent instructions into single cycles while
