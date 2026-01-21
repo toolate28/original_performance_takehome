@@ -180,7 +180,8 @@ class KernelBuilder:
         6. Batch all constant loads together for maximum VLIW packing
         """
         # Max unroll with scratch space constraint
-        UNROLL_FACTOR = min(110, batch_size)
+        # With 8 regs/iter and ~300 for constants/other: (1536-300)/8 ≈ 154
+        UNROLL_FACTOR = min(154, batch_size)
         
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -237,17 +238,15 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting loop"))
 
         # Allocate registers for each unrolled iteration
+        # Optimize: use fewer address registers per iteration
         regs = []
         for u in range(UNROLL_FACTOR):
             regs.append({
                 'idx': self.alloc_scratch(f"idx{u}"),
                 'val': self.alloc_scratch(f"val{u}"),
                 'nval': self.alloc_scratch(f"nval{u}"),
-                'aidl': self.alloc_scratch(f"aidl{u}"),
-                'avl': self.alloc_scratch(f"avl{u}"),
-                'anl': self.alloc_scratch(f"anl{u}"),
-                'aids': self.alloc_scratch(f"aids{u}"),
-                'avs': self.alloc_scratch(f"avs{u}"),
+                'addr1': self.alloc_scratch(f"a1_{u}"),  # Reusable address register
+                'addr2': self.alloc_scratch(f"a2_{u}"),  # Reusable address register
                 't1': self.alloc_scratch(f"t1_{u}"),
                 't2': self.alloc_scratch(f"t2_{u}"),
                 't3': self.alloc_scratch(f"t3_{u}"),
@@ -262,35 +261,26 @@ class KernelBuilder:
                 # PHASE 1: Load indices
                 for u in range(n):
                     r = regs[u]
-                    body.append(("alu", ("+", r['aidl'], self.scratch["inp_indices_p"], i_consts[i_base+u])))
+                    body.append(("alu", ("+", r['addr1'], self.scratch["inp_indices_p"], i_consts[i_base+u])))
                 for u in range(n):
                     r = regs[u]
-                    body.append(("load", ("load", r['idx'], r['aidl'])))
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("debug", ("compare", r['idx'], (round, i_base+u, "idx"))))
+                    body.append(("load", ("load", r['idx'], r['addr1'])))
                 
                 # PHASE 2: Load values
                 for u in range(n):
                     r = regs[u]
-                    body.append(("alu", ("+", r['avl'], self.scratch["inp_values_p"], i_consts[i_base+u])))
+                    body.append(("alu", ("+", r['addr1'], self.scratch["inp_values_p"], i_consts[i_base+u])))
                 for u in range(n):
                     r = regs[u]
-                    body.append(("load", ("load", r['val'], r['avl'])))
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("debug", ("compare", r['val'], (round, i_base+u, "val"))))
+                    body.append(("load", ("load", r['val'], r['addr1'])))
                 
                 # PHASE 3: Load node values
                 for u in range(n):
                     r = regs[u]
-                    body.append(("alu", ("+", r['anl'], self.scratch["forest_values_p"], r['idx'])))
+                    body.append(("alu", ("+", r['addr1'], self.scratch["forest_values_p"], r['idx'])))
                 for u in range(n):
                     r = regs[u]
-                    body.append(("load", ("load", r['nval'], r['anl'])))
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("debug", ("compare", r['nval'], (round, i_base+u, "node_val"))))
+                    body.append(("load", ("load", r['nval'], r['addr1'])))
                 
                 # PHASE 4: XOR
                 for u in range(n):
@@ -312,11 +302,6 @@ class KernelBuilder:
                     for u in range(n):
                         r = regs[u]
                         body.append(("alu", (op2, r['val'], r['t1'], r['t2'])))
-                        body.append(("debug", ("compare", r['val'], (round, i_base+u, "hash_stage", hi))))
-                
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("debug", ("compare", r['val'], (round, i_base+u, "hashed_val"))))
                 
                 # PHASE 6: Update indices
                 for u in range(n):
@@ -334,9 +319,6 @@ class KernelBuilder:
                 for u in range(n):
                     r = regs[u]
                     body.append(("alu", ("+", r['idx'], r['idx'], r['t3'])))
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("debug", ("compare", r['idx'], (round, i_base+u, "next_idx"))))
                 
                 # PHASE 7: Wrap indices
                 for u in range(n):
@@ -345,23 +327,20 @@ class KernelBuilder:
                 for u in range(n):
                     r = regs[u]
                     body.append(("alu", ("*", r['idx'], r['idx'], r['t1'])))
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("debug", ("compare", r['idx'], (round, i_base+u, "wrapped_idx"))))
                 
                 # PHASE 8: Store results
                 for u in range(n):
                     r = regs[u]
-                    body.append(("alu", ("+", r['aids'], self.scratch["inp_indices_p"], i_consts[i_base+u])))
+                    body.append(("alu", ("+", r['addr1'], self.scratch["inp_indices_p"], i_consts[i_base+u])))
                 for u in range(n):
                     r = regs[u]
-                    body.append(("store", ("store", r['aids'], r['idx'])))
+                    body.append(("store", ("store", r['addr1'], r['idx'])))
                 for u in range(n):
                     r = regs[u]
-                    body.append(("alu", ("+", r['avs'], self.scratch["inp_values_p"], i_consts[i_base+u])))
+                    body.append(("alu", ("+", r['addr2'], self.scratch["inp_values_p"], i_consts[i_base+u])))
                 for u in range(n):
                     r = regs[u]
-                    body.append(("store", ("store", r['avs'], r['val'])))
+                    body.append(("store", ("store", r['addr2'], r['val'])))
 
         self.instrs.extend(self.build(body))
         self.instrs.append({"flow": [("pause",)]})
