@@ -178,6 +178,177 @@ class KernelBuilder:
             instrs.append(current_bundle)
         
         return instrs
+    
+    def _local_bubble_fill(self, bundles: list[dict]) -> list[dict]:
+        """
+        Conservative local optimization: look ahead a few bundles and try to pull
+        instructions to fill bubbles while carefully checking ALL dependencies.
+        """
+        if len(bundles) <= 1:
+            return bundles
+        
+        LOOKAHEAD = 3  # Conservative lookahead
+        
+        # Precompute dependencies for all bundles
+        bundle_deps = []
+        for bundle in bundles:
+            reads = set()
+            writes = set()
+            for engine, slots in bundle.items():
+                for slot in slots:
+                    r, w = self._analyze_dependencies(engine, slot)
+                    reads.update(r)
+                    writes.update(w)
+            bundle_deps.append((reads, writes))
+        
+        for i in range(len(bundles)):
+            # Calculate current slot usage
+            slot_usage = {e: 0 for e in SLOT_LIMITS}
+            for engine, slots in bundles[i].items():
+                slot_usage[engine] = len(slots)
+            
+            # Skip if all slots are full
+            if all(slot_usage[e] >= SLOT_LIMITS[e] for e in SLOT_LIMITS):
+                continue
+            
+            # Try to pull from next few bundles
+            for j in range(i + 1, min(i + 1 + LOOKAHEAD, len(bundles))):
+                if not bundles[j]:
+                    continue
+                
+                # For each engine, try to move ONE instruction at a time
+                for engine in list(bundles[j].keys()):
+                    if slot_usage[engine] >= SLOT_LIMITS[engine]:
+                        continue
+                    
+                    slots_in_j = bundles[j][engine]
+                    if not slots_in_j:
+                        continue
+                    
+                    # Try first instruction
+                    candidate = slots_in_j[0]
+                    r, w = self._analyze_dependencies(engine, candidate)
+                    
+                    # Check that moving this instruction doesn't violate dependencies
+                    # with bundles i and all intermediate bundles between i and j
+                    safe = True
+                    
+                    # Check bundle i
+                    if (r & bundle_deps[i][1]) or (w & bundle_deps[i][1]) or (w & bundle_deps[i][0]):
+                        safe = False
+                    
+                    # Check intermediate bundles
+                    if safe:
+                        for k in range(i + 1, j):
+                            kr, kw = bundle_deps[k]
+                            if (r & kw) or (w & kr) or (w & kw):
+                                safe = False
+                                break
+                    
+                    if safe:
+                        # Move it
+                        if engine not in bundles[i]:
+                            bundles[i][engine] = []
+                        bundles[i][engine].append(candidate)
+                        
+                        # Remove from bundle j
+                        bundles[j][engine] = slots_in_j[1:]
+                        if not bundles[j][engine]:
+                            del bundles[j][engine]
+                        
+                        # Update dependencies and slot usage
+                        bundle_deps[i] = (
+                            bundle_deps[i][0] | r,
+                            bundle_deps[i][1] | w
+                        )
+                        slot_usage[engine] += 1
+        
+        # Remove empty bundles
+        return [b for b in bundles if b]
+    
+    
+    def _analyze_dependencies(self, engine: str, slot: tuple):
+        """Extract read/write register sets for dependency analysis."""
+        reads, writes = set(), set()
+        
+        if engine == "alu":
+            op, dest, src1, src2 = slot
+            writes.add(dest)
+            reads.update([src1, src2])
+        elif engine == "valu":
+            if slot[0] == "vbroadcast":
+                _, dest, src = slot
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                reads.add(src)
+            else:
+                # Most valu operations
+                op = slot[0]
+                if len(slot) == 4:
+                    _, dest, a1, a2 = slot
+                    for i in range(VLEN):
+                        writes.add(dest + i)
+                        reads.add(a1 + i)
+                        reads.add(a2 + i)
+                elif len(slot) == 5:  # multiply_add
+                    _, dest, a, b, c = slot
+                    for i in range(VLEN):
+                        writes.add(dest + i)
+                        reads.add(a + i)
+                        reads.add(b + i)
+                        reads.add(c + i)
+        elif engine == "load":
+            if slot[0] == "load":
+                _, dest, addr = slot
+                writes.add(dest)
+                reads.add(addr)
+            elif slot[0] == "load_offset":
+                _, dest, addr, offset = slot
+                writes.add(dest + offset)
+                reads.add(addr + offset)
+            elif slot[0] == "vload":
+                _, dest, addr = slot
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                reads.add(addr)
+            elif slot[0] == "const":
+                _, dest, _ = slot
+                writes.add(dest)
+        elif engine == "store":
+            if slot[0] == "store":
+                _, addr, val = slot
+                reads.update([addr, val])
+            elif slot[0] == "vstore":
+                _, addr, src = slot
+                reads.add(addr)
+                for i in range(VLEN):
+                    reads.add(src + i)
+        elif engine == "flow":
+            if slot[0] == "select":
+                _, dest, cond, a, b = slot
+                writes.add(dest)
+                reads.update([cond, a, b])
+            elif slot[0] == "vselect":
+                _, dest, cond, a, b = slot
+                for i in range(VLEN):
+                    writes.add(dest + i)
+                    reads.add(cond + i)
+                    reads.add(a + i)
+                    reads.add(b + i)
+            elif slot[0] in ("add_imm",):
+                _, dest, src, _ = slot
+                writes.add(dest)
+                reads.add(src)
+        elif engine == "debug":
+            if slot[0] == "compare":
+                _, loc, _ = slot
+                reads.add(loc)
+            elif slot[0] == "vcompare":
+                _, loc, _ = slot
+                for i in range(VLEN):
+                    reads.add(loc + i)
+        
+        return reads, writes
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -197,17 +368,6 @@ class KernelBuilder:
             self.add("load", ("const", addr, val))
             self.const_map[val] = addr
         return self.const_map[val]
-
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
-
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
-        return slots
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
