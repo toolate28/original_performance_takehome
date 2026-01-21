@@ -70,7 +70,7 @@ class KernelBuilder:
                 writes.add(dest)
                 reads.update([cond, a, b])
         elif engine == "debug":
-            # Debug operations don't have dependencies
+            # Debug operations only read, never write
             if slot[0] == "compare":
                 _, loc, _ = slot
                 reads.add(loc)
@@ -186,28 +186,19 @@ class KernelBuilder:
 
         body = []  # array of slots
         
-        UNROLL_FACTOR = 55  # Fibonacci golden resonance - higher parallelism
+        UNROLL_FACTOR = 64  # Power of 2 for perfect alignment with batch_size=256
         
-        # Allocate separate registers per unrolled iteration (eliminate RAW hazards)
+        # Allocate separate registers per unrolled iteration with minimal footprint
         tmp_regs = []
         for u in range(UNROLL_FACTOR):
-            # Pre-allocate hash temporaries for each unrolled iteration
-            hash_tmp1_addrs = []
-            hash_tmp2_addrs = []
-            for hi in range(len(HASH_STAGES)):
-                hash_tmp1_addrs.append(self.alloc_scratch(f"hash_tmp1_{u}_{hi}"))
-                hash_tmp2_addrs.append(self.alloc_scratch(f"hash_tmp2_{u}_{hi}"))
-            
+            # Minimal register set - reuse temporaries aggressively
             tmp_regs.append({
                 'idx': self.alloc_scratch(f"tmp_idx_{u}"),
                 'val': self.alloc_scratch(f"tmp_val_{u}"),
                 'node_val': self.alloc_scratch(f"tmp_node_val_{u}"),
                 'addr': self.alloc_scratch(f"tmp_addr_{u}"),
                 'tmp1': self.alloc_scratch(f"tmp1_{u}"),
-                'tmp2': self.alloc_scratch(f"tmp2_{u}"),
-                'tmp3': self.alloc_scratch(f"tmp3_{u}"),
-                'hash_tmp1_addrs': hash_tmp1_addrs,
-                'hash_tmp2_addrs': hash_tmp2_addrs,
+                # Reuse tmp1 for hash operations instead of allocating separate arrays
             })
         
         # Pre-allocate constants for all batch indices
@@ -262,36 +253,36 @@ class KernelBuilder:
                     tr = tmp_regs[u]
                     body.append(("debug", ("compare", tr['node_val'], (round, i, "node_val"))))
                 
-                # Stage 4: Hash all values - interleave operations from all iterations
+                # Stage 4: Hash all values - simplified with minimal temporaries
                 # XOR operations for all iterations
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
                     body.append(("alu", ("^", tr['val'], tr['val'], tr['node_val'])))
                 
-                # Hash operations interleaved by stage
+                # Hash stages - reuse tmp1 and addr as temporaries (emergent efficiency)
                 for hi in range(len(HASH_STAGES)):
                     op1, val1, op2, op3, val3 = HASH_STAGES[hi]
                     
-                    # All op1 operations for this stage across all iterations
+                    # All op1 operations
                     for u in range(num_iters):
                         i = i_base + u
                         tr = tmp_regs[u]
-                        body.append(("alu", (op1, tr['hash_tmp1_addrs'][hi], tr['val'], self.scratch_const(val1))))
+                        body.append(("alu", (op1, tr['tmp1'], tr['val'], self.scratch_const(val1))))
                     
-                    # All op3 operations for this stage across all iterations
+                    # All op3 operations (reuse addr as temp)
                     for u in range(num_iters):
                         i = i_base + u
                         tr = tmp_regs[u]
-                        body.append(("alu", (op3, tr['hash_tmp2_addrs'][hi], tr['val'], self.scratch_const(val3))))
+                        body.append(("alu", (op3, tr['addr'], tr['val'], self.scratch_const(val3))))
                     
-                    # All op2 operations for this stage across all iterations
+                    # All op2 operations
                     for u in range(num_iters):
                         i = i_base + u
                         tr = tmp_regs[u]
-                        body.append(("alu", (op2, tr['val'], tr['hash_tmp1_addrs'][hi], tr['hash_tmp2_addrs'][hi])))
+                        body.append(("alu", (op2, tr['val'], tr['tmp1'], tr['addr'])))
                     
-                    # Debug comparisons for this stage
+                    # Debug comparisons
                     for u in range(num_iters):
                         i = i_base + u
                         tr = tmp_regs[u]
@@ -315,8 +306,8 @@ class KernelBuilder:
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
-                    # Flow→ALU arithmetic transformation: tmp3 = 2 - tmp1
-                    body.append(("alu", ("-", tr['tmp3'], two_const, tr['tmp1'])))
+                    # Flow→ALU: addr = 2 - tmp1 (holographic conservation via reuse)
+                    body.append(("alu", ("-", tr['addr'], two_const, tr['tmp1'])))
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
@@ -324,7 +315,7 @@ class KernelBuilder:
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
-                    body.append(("alu", ("+", tr['idx'], tr['idx'], tr['tmp3'])))
+                    body.append(("alu", ("+", tr['idx'], tr['idx'], tr['addr'])))
                 for u in range(num_iters):
                     i = i_base + u
                     tr = tmp_regs[u]
