@@ -254,7 +254,17 @@ class KernelBuilder:
         
         # Unroll across multiple vector batches to maximize parallelism
         # With separate addr_gather per batch (73 regs/batch): max ~18 batches
-        VEC_UNROLL = min(18, num_vec_batches)
+        # Each unrolled batch allocates:
+        #   - 8 VLEN-wide vectors
+        #   - 1 scalar addr_base
+        #   - VLEN scalar addr_gather entries
+        # So per-batch scratch usage in "words" is:
+        per_batch_scratch_words = 9 * VLEN + 1
+        remaining_scratch = SCRATCH_SIZE - self.scratch_ptr
+        # Ensure we do not overrun scratch space when choosing VEC_UNROLL.
+        # We require at least one batch; cap by what fits in remaining scratch.
+        max_batches_by_scratch = max(1, remaining_scratch // per_batch_scratch_words)
+        VEC_UNROLL = min(18, num_vec_batches, max_batches_by_scratch)
         
         # Allocate registers for VEC_UNROLL batches
         vec_regs = []
