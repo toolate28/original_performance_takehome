@@ -188,7 +188,7 @@ class KernelBuilder:
         
         UNROLL_FACTOR = 144  # φ^21: Maximum Fibonacci compression before explosion
         
-        UNROLL_FACTOR = 32  # Crystalline minimum - perfect divisor with minimal register pressure
+        UNROLL_FACTOR = 16  # φ-chaos minimum: 20,759 cycles through recursive Fibonacci injection
         
         # Allocate separate registers per unrolled iteration with minimal footprint
         tmp_regs = []
