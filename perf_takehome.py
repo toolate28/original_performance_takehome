@@ -264,24 +264,31 @@ class KernelBuilder:
 
         body = []  # array of slots
 
-        # Process VLEN elements at a time
+        # Process VLEN elements at a time with vector unrolling
         vec_batch_size = batch_size // VLEN
+        VEC_UNROLL = 16  # Process 16 vector blocks per iteration
         
-        # Allocate vector registers
-        v_idx = self.alloc_scratch("v_idx", VLEN)
-        v_val = self.alloc_scratch("v_val", VLEN)
-        v_node_val = self.alloc_scratch("v_node_val", VLEN)
-        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
-        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
-        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
-        v_const1 = self.alloc_scratch("v_const1", VLEN)  # Reuse for all hash stages
-        v_const2 = self.alloc_scratch("v_const2", VLEN)  # Reuse for all hash stages
+        # Allocate vector registers for unrolled vector iterations
+        v_regs = []
+        for u in range(VEC_UNROLL):
+            v_regs.append({
+                'idx': self.alloc_scratch(f"v{u}_idx", VLEN),
+                'val': self.alloc_scratch(f"v{u}_val", VLEN),
+                'node_val': self.alloc_scratch(f"v{u}_node_val", VLEN),
+                'tmp1': self.alloc_scratch(f"v{u}_tmp1", VLEN),
+                'tmp2': self.alloc_scratch(f"v{u}_tmp2", VLEN),
+                'tmp3': self.alloc_scratch(f"v{u}_tmp3", VLEN),
+            })
+        
+        # Shared vector constants and temporaries
+        v_const1 = self.alloc_scratch("v_const1", VLEN)
+        v_const2 = self.alloc_scratch("v_const2", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
         
         # Scalar temporaries
-        addr_tmp = self.alloc_scratch("addr_tmp")
+        addr_tmp = [self.alloc_scratch(f"addr_tmp{u}") for u in range(VEC_UNROLL)]
         
         # Pre-allocate constants for hash operations
         hash_constants = []
@@ -296,73 +303,164 @@ class KernelBuilder:
         body.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
 
         for round in range(rounds):
-            for vec_i in range(vec_batch_size):
-                i = vec_i * VLEN
-                i_const = self.scratch_const(i)
+            for vec_i_base in range(0, vec_batch_size, VEC_UNROLL):
+                num_vec_unrolled = min(VEC_UNROLL, vec_batch_size - vec_i_base)
                 
-                # Stage 1: Load indices and values (vectorized)
-                body.append(("alu", ("+", addr_tmp, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("vload", v_idx, addr_tmp)))
-                body.append(("alu", ("+", addr_tmp, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("vload", v_val, addr_tmp)))
+                # Stage 1: Load indices and values for all unrolled vectors
+                for u in range(num_vec_unrolled):
+                    vec_i = vec_i_base + u
+                    i = vec_i * VLEN
+                    i_const = self.scratch_const(i)
+                    vr = v_regs[u]
+                    at = addr_tmp[u]
+                    
+                    body.append(("alu", ("+", at, self.scratch["inp_indices_p"], i_const)))
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    at = addr_tmp[u]
+                    body.append(("load", ("vload", vr['idx'], at)))
+                
+                for u in range(num_vec_unrolled):
+                    vec_i = vec_i_base + u
+                    i = vec_i * VLEN
+                    i_const = self.scratch_const(i)
+                    vr = v_regs[u]
+                    at = addr_tmp[u]
+                    body.append(("alu", ("+", at, self.scratch["inp_values_p"], i_const)))
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    at = addr_tmp[u]
+                    body.append(("load", ("vload", vr['val'], at)))
                 
                 # Debug loaded values
-                for vi in range(VLEN):
-                    body.append(("debug", ("compare", v_idx + vi, (round, i + vi, "idx"))))
-                for vi in range(VLEN):
-                    body.append(("debug", ("compare", v_val + vi, (round, i + vi, "val"))))
+                for u in range(num_vec_unrolled):
+                    vec_i = vec_i_base + u
+                    i = vec_i * VLEN
+                    vr = v_regs[u]
+                    for vi in range(VLEN):
+                        body.append(("debug", ("compare", vr['idx'] + vi, (round, i + vi, "idx"))))
+                for u in range(num_vec_unrolled):
+                    vec_i = vec_i_base + u
+                    i = vec_i * VLEN
+                    vr = v_regs[u]
+                    for vi in range(VLEN):
+                        body.append(("debug", ("compare", vr['val'] + vi, (round, i + vi, "val"))))
                 
-                # Stage 2: Calculate all forest addresses and load node values
-                for vi in range(VLEN):
-                    body.append(("alu", ("+", addr_tmp, self.scratch["forest_values_p"], v_idx + vi)))
-                    body.append(("load", ("load", v_node_val + vi, addr_tmp)))
+                # Stage 2: Load node values (scalar loads)
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    at = addr_tmp[u]
+                    for vi in range(VLEN):
+                        body.append(("alu", ("+", at, self.scratch["forest_values_p"], vr['idx'] + vi)))
+                        body.append(("load", ("load", vr['node_val'] + vi, at)))
                 
                 # Debug node values
-                for vi in range(VLEN):
-                    body.append(("debug", ("compare", v_node_val + vi, (round, i + vi, "node_val"))))
+                for u in range(num_vec_unrolled):
+                    vec_i = vec_i_base + u
+                    i = vec_i * VLEN
+                    vr = v_regs[u]
+                    for vi in range(VLEN):
+                        body.append(("debug", ("compare", vr['node_val'] + vi, (round, i + vi, "node_val"))))
                 
-                # Stage 3: XOR (vectorized)
-                body.append(("valu", ("^", v_val, v_val, v_node_val)))
+                # Stage 3: XOR (vectorized for all unrolled iterations)
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    body.append(("valu", ("^", vr['val'], vr['val'], vr['node_val'])))
                 
-                # Stage 4: Hash operations (vectorized)
+                # Stage 4: Hash operations (vectorized for all unrolled iterations)
                 for hi, (op1, const1, op2, op3, const2) in enumerate(hash_constants):
                     body.append(("valu", ("vbroadcast", v_const1, const1)))
                     body.append(("valu", ("vbroadcast", v_const2, const2)))
-                    body.append(("valu", (op1, v_tmp1, v_val, v_const1)))
-                    body.append(("valu", (op3, v_tmp2, v_val, v_const2)))
-                    body.append(("valu", (op2, v_val, v_tmp1, v_tmp2)))
-                    # Debug each hash stage immediately after completing it
-                    for vi in range(VLEN):
-                        body.append(("debug", ("compare", v_val + vi, (round, i + vi, "hash_stage", hi))))
+                    for u in range(num_vec_unrolled):
+                        vr = v_regs[u]
+                        body.append(("valu", (op1, vr['tmp1'], vr['val'], v_const1)))
+                    for u in range(num_vec_unrolled):
+                        vr = v_regs[u]
+                        body.append(("valu", (op3, vr['tmp2'], vr['val'], v_const2)))
+                    for u in range(num_vec_unrolled):
+                        vr = v_regs[u]
+                        body.append(("valu", (op2, vr['val'], vr['tmp1'], vr['tmp2'])))
+                    # Debug each hash stage
+                    for u in range(num_vec_unrolled):
+                        vec_i = vec_i_base + u
+                        i = vec_i * VLEN
+                        vr = v_regs[u]
+                        for vi in range(VLEN):
+                            body.append(("debug", ("compare", vr['val'] + vi, (round, i + vi, "hash_stage", hi))))
                 
                 # Debug hashed values
-                for vi in range(VLEN):
-                    body.append(("debug", ("compare", v_val + vi, (round, i + vi, "hashed_val"))))
+                for u in range(num_vec_unrolled):
+                    vec_i = vec_i_base + u
+                    i = vec_i * VLEN
+                    vr = v_regs[u]
+                    for vi in range(VLEN):
+                        body.append(("debug", ("compare", vr['val'] + vi, (round, i + vi, "hashed_val"))))
                 
-                # Stage 5: Index updates (vectorized)
-                body.append(("valu", ("%", v_tmp1, v_val, v_two)))
-                body.append(("valu", ("==", v_tmp1, v_tmp1, v_zero)))
-                body.append(("valu", ("-", v_tmp3, v_two, v_tmp1)))
-                body.append(("valu", ("*", v_idx, v_idx, v_two)))
-                body.append(("valu", ("+", v_idx, v_idx, v_tmp3)))
+                # Stage 5: Index updates (vectorized for all unrolled iterations)
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    body.append(("valu", ("%", vr['tmp1'], vr['val'], v_two)))
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    body.append(("valu", ("==", vr['tmp1'], vr['tmp1'], v_zero)))
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    body.append(("valu", ("-", vr['tmp3'], v_two, vr['tmp1'])))
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    body.append(("valu", ("*", vr['idx'], vr['idx'], v_two)))
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    body.append(("valu", ("+", vr['idx'], vr['idx'], vr['tmp3'])))
                 
                 # Debug next_idx
-                for vi in range(VLEN):
-                    body.append(("debug", ("compare", v_idx + vi, (round, i + vi, "next_idx"))))
+                for u in range(num_vec_unrolled):
+                    vec_i = vec_i_base + u
+                    i = vec_i * VLEN
+                    vr = v_regs[u]
+                    for vi in range(VLEN):
+                        body.append(("debug", ("compare", vr['idx'] + vi, (round, i + vi, "next_idx"))))
                 
-                # Stage 6: Bounds checking (vectorized)
-                body.append(("valu", ("<", v_tmp1, v_idx, v_n_nodes)))
-                body.append(("valu", ("*", v_idx, v_tmp1, v_idx)))
+                # Stage 6: Bounds checking (vectorized for all unrolled iterations)
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    body.append(("valu", ("<", vr['tmp1'], vr['idx'], v_n_nodes)))
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    body.append(("valu", ("*", vr['idx'], vr['tmp1'], vr['idx'])))
                 
                 # Debug wrapped_idx
-                for vi in range(VLEN):
-                    body.append(("debug", ("compare", v_idx + vi, (round, i + vi, "wrapped_idx"))))
+                for u in range(num_vec_unrolled):
+                    vec_i = vec_i_base + u
+                    i = vec_i * VLEN
+                    vr = v_regs[u]
+                    for vi in range(VLEN):
+                        body.append(("debug", ("compare", vr['idx'] + vi, (round, i + vi, "wrapped_idx"))))
                 
-                # Stage 7: Store results (vectorized)
-                body.append(("alu", ("+", addr_tmp, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("vstore", addr_tmp, v_idx)))
-                body.append(("alu", ("+", addr_tmp, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("vstore", addr_tmp, v_val)))
+                # Stage 7: Store results (vectorized for all unrolled iterations)
+                for u in range(num_vec_unrolled):
+                    vec_i = vec_i_base + u
+                    i = vec_i * VLEN
+                    i_const = self.scratch_const(i)
+                    vr = v_regs[u]
+                    at = addr_tmp[u]
+                    body.append(("alu", ("+", at, self.scratch["inp_indices_p"], i_const)))
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    at = addr_tmp[u]
+                    body.append(("store", ("vstore", at, vr['idx'])))
+                
+                for u in range(num_vec_unrolled):
+                    vec_i = vec_i_base + u
+                    i = vec_i * VLEN
+                    i_const = self.scratch_const(i)
+                    vr = v_regs[u]
+                    at = addr_tmp[u]
+                    body.append(("alu", ("+", at, self.scratch["inp_values_p"], i_const)))
+                for u in range(num_vec_unrolled):
+                    vr = v_regs[u]
+                    at = addr_tmp[u]
+                    body.append(("store", ("vstore", at, vr['val'])))
 
         body_instrs = self.build(body, vliw=True)
         self.instrs.extend(body_instrs)
