@@ -277,9 +277,8 @@ class KernelBuilder:
                     # Wrap index
                     body.append(("alu", ("<", tr['tmp1'], tr['idx'], self.scratch["n_nodes"])))
                     body.append(("alu", ("*", tr['tmp2'], tr['tmp1'], tr['idx'])))  # Arithmetic select!
-                    body.append(("alu", ("-", tr['tmp3'], one_const, tr['tmp1'])))
-                    body.append(("alu", ("*", tr['tmp3'], tr['tmp3'], zero_const)))
-                    body.append(("alu", ("+", tr['idx'], tr['tmp2'], tr['tmp3'])))
+                    # tr['idx'] = tr['tmp2']; avoid redundant tmp3 * 0 and add of zero
+                    body.append(("alu", ("+", tr['idx'], tr['tmp2'], zero_const)))
                     body.append(("debug", ("compare", tr['idx'], (round, i, "wrapped_idx"))))
                 
                 # Stage 6: Store results in parallel
