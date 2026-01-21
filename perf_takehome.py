@@ -59,6 +59,24 @@ class KernelBuilder:
             reads.add(src1)
             reads.add(src2)
             writes.add(dest)
+        elif engine == "valu":
+            # Vector ALU operations
+            if slot[0] == "vbroadcast":
+                # ("vbroadcast", dest, src) - writes VLEN elements
+                _, dest, src = slot
+                reads.add(src)
+                for i in range(VLEN):
+                    writes.add(dest + i)
+            elif len(slot) == 4:
+                # (op, dest, src1, src2) - all are vectors
+                _, dest, src1, src2 = slot
+                for i in range(VLEN):
+                    reads.add(src1 + i)
+                    reads.add(src2 + i)
+                    writes.add(dest + i)
+            else:
+                # Fallback for other valu ops
+                pass
         elif engine == "load":
             if slot[0] == "const":
                 # ("const", dest, val) - only writes
@@ -67,11 +85,23 @@ class KernelBuilder:
                 # ("load", dest, addr)
                 writes.add(slot[1])
                 reads.add(slot[2])
+            elif slot[0] == "vload":
+                # ("vload", dest, addr) - loads VLEN elements
+                _, dest, addr = slot
+                reads.add(addr)
+                for i in range(VLEN):
+                    writes.add(dest + i)
         elif engine == "store":
             if slot[0] == "store":
                 # ("store", addr, src)
                 reads.add(slot[1])
                 reads.add(slot[2])
+            elif slot[0] == "vstore":
+                # ("vstore", addr, src) - stores VLEN elements
+                _, addr, src = slot
+                reads.add(addr)
+                for i in range(VLEN):
+                    reads.add(src + i)
         elif engine == "flow":
             if slot[0] == "select":
                 # ("select", dest, cond, a, b)
@@ -170,17 +200,17 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Highly optimized kernel with aggressive unrolling and instruction-level parallelism.
+        SIMD vectorized kernel using vload/vstore/valu instructions.
         Key optimizations:
-        1. Unroll loop by UNROLL_FACTOR to expose ILP
-        2. Allocate separate registers per iteration to eliminate dependencies
-        3. Group operations by type to maximize VLIW packing (12 ALU, 2 load, 2 store per cycle)
-        4. Replace flow ops with arithmetic to increase ALU utilization
-        5. Pre-compute and cache hash constants
-        6. Batch all constant loads together for maximum VLIW packing
+        1. Process 8 elements at once using VLEN=8 vector operations
+        2. Use vload/vstore for contiguous memory access (indices and values)
+        3. Use valu for vectorizable operations (XOR, hash arithmetic)
+        4. Unroll by 6 vector groups to maximize valu utilization (6 slots available)
+        5. Keep indexed loads (node_val) scalar as they can't be vectorized
+        6. Pre-broadcast constants outside loop to reduce redundant operations
         """
-        # Smaller unroll factor for better packing - matches ALU slot limit
-        UNROLL_FACTOR = 12
+        # Process 6 vector groups (48 elements) per iteration to maximize 6 valu slots
+        VEC_UNROLL = 6
         
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -194,10 +224,8 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
         
-        # Pre-allocate all scratch addresses for constants first
-        # This prevents them from being added to instrs during allocation
-        const_values_needed = set([0, 1, 2])  # zero, one, two
-        const_values_needed.update(range(batch_size))  # i values
+        # Pre-allocate constants needed
+        const_values_needed = set([0, 1, 2, VLEN])
         for op1, val1, op2, op3, val3 in HASH_STAGES:
             const_values_needed.add(val1)
             const_values_needed.add(val3)
@@ -207,7 +235,7 @@ class KernelBuilder:
         for val in sorted(const_values_needed):
             const_addrs[val] = self.alloc_scratch(f"const_{val}")
         
-        # Now batch all const loads together
+        # Batch all const loads together
         const_body = []
         for val in sorted(const_values_needed):
             const_body.append(("load", ("const", const_addrs[val], val)))
@@ -223,123 +251,197 @@ class KernelBuilder:
 
         # Set up const map for easy access
         self.const_map = const_addrs
-        i_consts = [const_addrs[i] for i in range(batch_size)]
         zero_const = const_addrs[0]
         one_const = const_addrs[1]
         two_const = const_addrs[2]
+        vlen_const = const_addrs[VLEN]
         
-        # Hash constants
+        # Hash constants - we'll need to broadcast these for vector ops
         hash_consts = []
         for op1, val1, op2, op3, val3 in HASH_STAGES:
             hash_consts.append((const_addrs[val1], const_addrs[val3]))
 
         self.add("flow", ("pause",))
-        self.add("debug", ("comment", "Starting loop"))
+        self.add("debug", ("comment", "Starting SIMD loop"))
 
-        # Allocate registers for each unrolled iteration
-        # Optimize: use fewer address registers per iteration
-        regs = []
-        for u in range(UNROLL_FACTOR):
-            regs.append({
-                'idx': self.alloc_scratch(f"idx{u}"),
-                'val': self.alloc_scratch(f"val{u}"),
-                'nval': self.alloc_scratch(f"nval{u}"),
-                'addr1': self.alloc_scratch(f"a1_{u}"),  # Reusable address register
-                'addr2': self.alloc_scratch(f"a2_{u}"),  # Reusable address register
-                't1': self.alloc_scratch(f"t1_{u}"),
-                't2': self.alloc_scratch(f"t2_{u}"),
-                't3': self.alloc_scratch(f"t3_{u}"),
+        # Allocate vector registers for unrolled iterations
+        # Each vector register holds VLEN=8 elements
+        vregs = []
+        for u in range(VEC_UNROLL):
+            vregs.append({
+                'idx_vec': self.alloc_scratch(f"idx_vec{u}", VLEN),
+                'val_vec': self.alloc_scratch(f"val_vec{u}", VLEN),
+                'addr_base': self.alloc_scratch(f"addr_base{u}"),
+                't1_vec': self.alloc_scratch(f"t1_vec{u}", VLEN),
+                't2_vec': self.alloc_scratch(f"t2_vec{u}", VLEN),
+                't3_vec': self.alloc_scratch(f"t3_vec{u}", VLEN),
+                'hash_c1': self.alloc_scratch(f"hash_c1_{u}", VLEN),
+                'hash_c3': self.alloc_scratch(f"hash_c3_{u}", VLEN),
             })
+        
+        # Allocate scalar registers for the indexed loads (can't vectorize)
+        # We only need nval and addr now since we access idx_vec directly
+        scalar_regs = []
+        for s in range(VLEN * VEC_UNROLL):
+            scalar_regs.append({
+                'nval': self.alloc_scratch(f"s_nval{s}"),
+                'addr': self.alloc_scratch(f"s_addr{s}"),
+            })
+        
+        # Number of vector groups = batch_size / VLEN = 256 / 8 = 32
+        n_vec_groups = batch_size // VLEN
+        
+        # Pre-allocate and broadcast common constants outside the loop
+        # This avoids redundant broadcasts in each iteration
+        zero_vec = self.alloc_scratch("zero_vec", VLEN)
+        two_vec = self.alloc_scratch("two_vec", VLEN)
+        n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
+        
+        # Pre-compute offset constants for all possible vec_base positions
+        # This eliminates const loads inside the loop
+        offset_consts = []
+        for vec_idx in range(n_vec_groups):
+            offset_consts.append(self.alloc_scratch(f"offset_{vec_idx}"))
+        
+        # Allocate hash constant vectors
+        hash_const_vecs = []
+        for hi, (c1, c3) in enumerate(hash_consts):
+            hash_const_vecs.append({
+                'c1_vec': self.alloc_scratch(f"hash_c1_vec{hi}", VLEN),
+                'c3_vec': self.alloc_scratch(f"hash_c3_vec{hi}", VLEN),
+            })
+        
+        # Load and broadcast constants once before the loop
+        pre_body = []
+        
+        # Load offset constants
+        for vec_idx in range(n_vec_groups):
+            pre_body.append(("load", ("const", offset_consts[vec_idx], vec_idx * VLEN)))
+        
+        # Broadcast common vectors
+        pre_body.append(("valu", ("vbroadcast", zero_vec, zero_const)))
+        pre_body.append(("valu", ("vbroadcast", two_vec, two_const)))
+        pre_body.append(("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])))
+        
+        # Broadcast hash constants
+        for hi, (c1, c3) in enumerate(hash_consts):
+            hv = hash_const_vecs[hi]
+            pre_body.append(("valu", ("vbroadcast", hv['c1_vec'], c1)))
+            pre_body.append(("valu", ("vbroadcast", hv['c3_vec'], c3)))
+        
+        self.instrs.extend(self.build(pre_body))
 
         body = []
 
         for round in range(rounds):
-            for i_base in range(0, batch_size, UNROLL_FACTOR):
-                n = min(UNROLL_FACTOR, batch_size - i_base)
+            for vec_base in range(0, n_vec_groups, VEC_UNROLL):
+                n = min(VEC_UNROLL, n_vec_groups - vec_base)
                 
-                # PHASE 1: Load indices
+                # PHASE 1: Vector load indices using pre-computed offsets
                 for u in range(n):
-                    r = regs[u]
-                    body.append(("alu", ("+", r['addr1'], self.scratch["inp_indices_p"], i_consts[i_base+u])))
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("load", ("load", r['idx'], r['addr1'])))
+                    vr = vregs[u]
+                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
                 
-                # PHASE 2: Load values
                 for u in range(n):
-                    r = regs[u]
-                    body.append(("alu", ("+", r['addr1'], self.scratch["inp_values_p"], i_consts[i_base+u])))
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("load", ("load", r['val'], r['addr1'])))
+                    vr = vregs[u]
+                    body.append(("load", ("vload", vr['idx_vec'], vr['addr_base'])))
                 
-                # PHASE 3: Load node values
+                # PHASE 2: Vector load values using pre-computed offsets
                 for u in range(n):
-                    r = regs[u]
-                    body.append(("alu", ("+", r['addr1'], self.scratch["forest_values_p"], r['idx'])))
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("load", ("load", r['nval'], r['addr1'])))
+                    vr = vregs[u]
+                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
                 
-                # PHASE 4: XOR
                 for u in range(n):
-                    r = regs[u]
-                    body.append(("alu", ("^", r['val'], r['val'], r['nval'])))
+                    vr = vregs[u]
+                    body.append(("load", ("vload", vr['val_vec'], vr['addr_base'])))
                 
-                # PHASE 5: Hash
+                # PHASE 3: Scalar indexed loads of node_val (can't vectorize)
+                # Calculate addresses directly from idx_vec
+                for u in range(n):
+                    vr = vregs[u]
+                    for vi in range(VLEN):
+                        sr = scalar_regs[u * VLEN + vi]
+                        body.append(("alu", ("+", sr['addr'], self.scratch["forest_values_p"], vr['idx_vec'] + vi)))
+                
+                # Load node values
+                for u in range(n):
+                    for vi in range(VLEN):
+                        sr = scalar_regs[u * VLEN + vi]
+                        body.append(("load", ("load", sr['nval'], sr['addr'])))
+                
+                # PHASE 4: Vector XOR - copy nval to t1_vec, then XOR with val_vec
+                for u in range(n):
+                    vr = vregs[u]
+                    for vi in range(VLEN):
+                        sr = scalar_regs[u * VLEN + vi]
+                        body.append(("alu", ("+", vr['t1_vec'] + vi, sr['nval'], zero_const)))
+                
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], vr['t1_vec'])))
+                
+                # PHASE 5: Vector hash using pre-broadcast constants
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    c1, c3 = hash_consts[hi]
+                    hv = hash_const_vecs[hi]
                     
                     for u in range(n):
-                        r = regs[u]
-                        body.append(("alu", (op1, r['t1'], r['val'], c1)))
+                        vr = vregs[u]
+                        body.append(("valu", (op1, vr['t1_vec'], vr['val_vec'], hv['c1_vec'])))
                     
                     for u in range(n):
-                        r = regs[u]
-                        body.append(("alu", (op3, r['t2'], r['val'], c3)))
+                        vr = vregs[u]
+                        body.append(("valu", (op3, vr['t2_vec'], vr['val_vec'], hv['c3_vec'])))
                     
                     for u in range(n):
-                        r = regs[u]
-                        body.append(("alu", (op2, r['val'], r['t1'], r['t2'])))
+                        vr = vregs[u]
+                        body.append(("valu", (op2, vr['val_vec'], vr['t1_vec'], vr['t2_vec'])))
                 
-                # PHASE 6: Update indices
+                # PHASE 6: Update indices using pre-broadcast constants
                 for u in range(n):
-                    r = regs[u]
-                    body.append(("alu", ("%", r['t1'], r['val'], two_const)))
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("alu", ("==", r['t1'], r['t1'], zero_const)))
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("alu", ("-", r['t3'], two_const, r['t1'])))
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("alu", ("*", r['idx'], r['idx'], two_const)))
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("alu", ("+", r['idx'], r['idx'], r['t3'])))
+                    vr = vregs[u]
+                    body.append(("valu", ("%", vr['t2_vec'], vr['val_vec'], two_vec)))
                 
-                # PHASE 7: Wrap indices
                 for u in range(n):
-                    r = regs[u]
-                    body.append(("alu", ("<", r['t1'], r['idx'], self.scratch["n_nodes"])))
-                for u in range(n):
-                    r = regs[u]
-                    body.append(("alu", ("*", r['idx'], r['idx'], r['t1'])))
+                    vr = vregs[u]
+                    body.append(("valu", ("==", vr['t2_vec'], vr['t2_vec'], zero_vec)))
                 
-                # PHASE 8: Store results
                 for u in range(n):
-                    r = regs[u]
-                    body.append(("alu", ("+", r['addr1'], self.scratch["inp_indices_p"], i_consts[i_base+u])))
+                    vr = vregs[u]
+                    body.append(("valu", ("-", vr['t3_vec'], two_vec, vr['t2_vec'])))
+                
                 for u in range(n):
-                    r = regs[u]
-                    body.append(("store", ("store", r['addr1'], r['idx'])))
+                    vr = vregs[u]
+                    body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], two_vec)))
+                
                 for u in range(n):
-                    r = regs[u]
-                    body.append(("alu", ("+", r['addr2'], self.scratch["inp_values_p"], i_consts[i_base+u])))
+                    vr = vregs[u]
+                    body.append(("valu", ("+", vr['idx_vec'], vr['idx_vec'], vr['t3_vec'])))
+                
+                # PHASE 7: Wrap indices using pre-broadcast constant
                 for u in range(n):
-                    r = regs[u]
-                    body.append(("store", ("store", r['addr2'], r['val'])))
+                    vr = vregs[u]
+                    body.append(("valu", ("<", vr['t1_vec'], vr['idx_vec'], n_nodes_vec)))
+                
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], vr['t1_vec'])))
+                
+                # PHASE 8: Vector store results using pre-computed offsets
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
+                
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("store", ("vstore", vr['addr_base'], vr['idx_vec'])))
+                
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
+                
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("store", ("vstore", vr['addr_base'], vr['val_vec'])))
 
         self.instrs.extend(self.build(body))
         self.instrs.append({"flow": [("pause",)]})
