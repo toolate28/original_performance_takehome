@@ -253,7 +253,7 @@ class KernelBuilder:
         num_vec_batches = batch_size // VLEN
         
         # Unroll across multiple vector batches to maximize parallelism
-        # With separate addr_gather per batch (73 regs/batch): max ~18 batches
+        # With separate addr_gather per batch (73 scratch words/batch): max ~18 batches
         # Each unrolled batch allocates:
         #   - 8 VLEN-wide vectors
         #   - 1 scalar addr_base
@@ -284,7 +284,7 @@ class KernelBuilder:
             }
             vec_regs.append(regs)
         
-        # Pre-broadcast all hash constants (one time setup)
+        # Pre-broadcast all hash constants (executed once at kernel start)
         hash_val1_vecs = []
         hash_val3_vecs = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
@@ -295,7 +295,7 @@ class KernelBuilder:
             hash_val1_vecs.append(val1_vec)
             hash_val3_vecs.append(val3_vec)
         
-        # Broadcast other constants once (one-time setup)
+        # Broadcast other constants (executed once at kernel start)
         two_vec = self.alloc_scratch("two_vec", VLEN)
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
         n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
@@ -303,31 +303,7 @@ class KernelBuilder:
         body.append(("valu", ("vbroadcast", zero_vec, zero_const)))
         body.append(("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])))
 
-        # Optimized: exploit early round locality
-        # Round 0: all at idx=0, Round 1: at idx 1 or 2, etc.
-        # Use conditional select for early rounds instead of gathers
-        MAX_EARLY_ROUND = min(7, rounds)  # Up to 128 unique indices
-        
         for round in range(rounds):
-            # Early rounds: few unique indices - use broadcast/select
-            if round < MAX_EARLY_ROUND:
-                max_idx = min(2**(round+1) - 1, n_nodes - 1)
-                
-                # Pre-load all possible node values for this round
-                node_vals = []
-                for idx in range(max_idx + 1):
-                    nv = self.alloc_scratch(f"node_val_r{round}_i{idx}")
-                    body.append(("alu", ("+", tmp1, self.scratch["forest_values_p"], self.scratch_const(idx))))
-                    body.append(("load", ("load", nv, tmp1)))
-                    node_vals.append(nv)
-                
-                # Broadcast node values to vectors
-                node_val_vecs = []
-                for idx in range(max_idx + 1):
-                    nvv = self.alloc_scratch(f"node_val_vec_r{round}_i{idx}", VLEN)
-                    body.append(("valu", ("vbroadcast", nvv, node_vals[idx])))
-                    node_val_vecs.append(nvv)
-            
             # Process in groups of VEC_UNROLL vector batches
             for vi_base in range(0, num_vec_batches, VEC_UNROLL):
                 num_batches = min(VEC_UNROLL, num_vec_batches - vi_base)
@@ -351,36 +327,18 @@ class KernelBuilder:
                 # ALU limit = 12/cycle (not 2!), Load limit = 2/cycle
                 # Calculate ALL addresses first (12 at a time), then do ALL loads (2 at a time)
                 
-                # Early rounds: use conditional select instead of gather
-                if round < MAX_EARLY_ROUND:
-                    max_idx = min(2**(round+1) - 1, n_nodes - 1)
+                # Phase 1: Calculate ALL gather addresses for ALL batches
+                # This will pack at 12 ALU ops/cycle instead of 1!
+                for lane in range(VLEN):
                     for u in range(num_batches):
                         regs = vec_regs[u]
-                        # Start with first node value
-                        body.append(("valu", ("vbroadcast", regs['vec_node_val'], node_vals[0])))
-                        # Conditionally select based on index
-                        for idx in range(1, max_idx + 1):
-                            # Create mask: vec_idx == idx
-                            idx_vec = self.alloc_scratch(f"idx_vec_{round}_{idx}", VLEN)
-                            mask_vec = self.alloc_scratch(f"mask_vec_{round}_{idx}", VLEN)
-                            body.append(("valu", ("vbroadcast", idx_vec, self.scratch_const(idx))))
-                            body.append(("valu", ("==", mask_vec, regs['vec_idx'], idx_vec)))
-                            # Select: node_val = mask ? node_val_vecs[idx] : node_val
-                            body.append(("flow", ("vselect", regs['vec_node_val'], mask_vec, node_val_vecs[idx], regs['vec_node_val'])))
-                else:
-                    # Late rounds: use gather (fallback to original)
-                    # Phase 1: Calculate ALL gather addresses for ALL batches
-                    # This will pack at 12 ALU ops/cycle instead of 1!
-                    for lane in range(VLEN):
-                        for u in range(num_batches):
-                            regs = vec_regs[u]
-                            body.append(("alu", ("+", regs['addr_gather'][lane], self.scratch["forest_values_p"], regs['vec_idx'] + lane)))
-                    
-                    # Phase 2: Perform ALL gather loads (2/cycle)
-                    for lane in range(VLEN):
-                        for u in range(num_batches):
-                            regs = vec_regs[u]
-                            body.append(("load", ("load", regs['vec_node_val'] + lane, regs['addr_gather'][lane])))
+                        body.append(("alu", ("+", regs['addr_gather'][lane], self.scratch["forest_values_p"], regs['vec_idx'] + lane)))
+                
+                # Phase 2: Perform ALL gather loads (2/cycle)
+                for lane in range(VLEN):
+                    for u in range(num_batches):
+                        regs = vec_regs[u]
+                        body.append(("load", ("load", regs['vec_node_val'] + lane, regs['addr_gather'][lane])))
                 
                 # === COMPUTE PHASE (interleaved) ===
                 # XOR all batches
