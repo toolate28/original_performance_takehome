@@ -236,40 +236,6 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash_stage_parallel(self, unroll_regs, num_unrolled, round, i_base, stage_idx):
-        """
-        Build hash operations for a specific stage across all unrolled iterations.
-        This enables better VLIW packing by grouping similar operations.
-        """
-        slots = []
-        op1, val1, op2, op3, val3 = HASH_STAGES[stage_idx]
-        const1 = self.scratch_const(val1)
-        const2 = self.scratch_const(val3)
-        
-        # First operation for all iterations (can execute in parallel)
-        for u in range(num_unrolled):
-            ur = unroll_regs[u]
-            slots.append(("alu", (op1, ur['tmp1'], ur['val'], const1)))
-        
-        # Second operation for all iterations (can execute in parallel)
-        for u in range(num_unrolled):
-            ur = unroll_regs[u]
-            slots.append(("alu", (op3, ur['tmp2'], ur['val'], const2)))
-        
-        # Combine results for all iterations (depends on previous operations)
-        for u in range(num_unrolled):
-            i = i_base + u
-            ur = unroll_regs[u]
-            slots.append(("alu", (op2, ur['val'], ur['tmp1'], ur['tmp2'])))
-        
-        # Debug ops grouped after all ALU operations
-        for u in range(num_unrolled):
-            i = i_base + u
-            ur = unroll_regs[u]
-            slots.append(("debug", ("compare", ur['val'], (round, i, "hash_stage", stage_idx))))
-        
-        return slots
-
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
