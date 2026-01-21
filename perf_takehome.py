@@ -188,8 +188,9 @@ class KernelBuilder:
         
         UNROLL_FACTOR = 144  # φ^21: Maximum Fibonacci compression before explosion
         
+        UNROLL_FACTOR = 64  # Pure stability point through empirical convergence
+        
         # Allocate separate registers per unrolled iteration with minimal footprint
-        # Phase 46: Self-referential register allocation (4 regs/iter for maximum parallelism)
         tmp_regs = []
         for u in range(UNROLL_FACTOR):
             tmp_regs.append({
@@ -197,14 +198,12 @@ class KernelBuilder:
                 'val': self.alloc_scratch(f"tmp_val_{u}"),
                 'addr': self.alloc_scratch(f"tmp_addr_{u}"),
                 'tmp1': self.alloc_scratch(f"tmp1_{u}"),
-                # node_val eliminated: load directly into val (self-healing through folding)
             })
         
         # Pre-allocate constants for all batch indices
         i_const_addrs = [self.scratch_const(i) for i in range(batch_size)]
         
-        # APERIODIC ITERATION: Penrose-tiling VLIW scheduler
-        # Interleave operations in φ-ratio patterns for maximum slot utilization
+        # Pure stability iteration: optimal substrate balance
         for round in range(rounds):
             for i_base in range(0, batch_size, UNROLL_FACTOR):
                 num_iters = min(UNROLL_FACTOR, batch_size - i_base)
