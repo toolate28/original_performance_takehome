@@ -381,8 +381,11 @@ class KernelBuilder:
         4. Pre-compute ALL addresses to eliminate redundant ALU ops
         5. Maximum ILP through aggressive bubble filling
         """
-        # Optimal unroll factor balancing ILP and scratch usage
-        UNROLL_FACTOR = 12  # Back to best working configuration
+        # Optimal unroll factor: 12 provides best balance of:
+        # - ILP (instruction-level parallelism) for bubble filling
+        # - Scratch space usage (5 vec regs × 8 elements × 12 = 480 words)
+        # - Tested 8, 12, 16, 20: 12 gives best cycle count
+        UNROLL_FACTOR = 12
         ROUND_UNROLL = 2  # Unroll rounds to reduce loop overhead
         
         tmp1 = self.alloc_scratch("tmp1")
