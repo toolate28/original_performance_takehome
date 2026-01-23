@@ -385,7 +385,7 @@ class KernelBuilder:
         5. Keep indexed loads (node_val) scalar as they can't be vectorized
         6. Pre-broadcast constants outside loop to reduce redundant operations
         """
-        # Process 8 vector groups (64 elements) per iteration - best balance
+        # Process 8 vector groups per iteration - optimal balance
         VEC_UNROLL = 8
         
         tmp1 = self.alloc_scratch("tmp1")
@@ -579,13 +579,10 @@ class KernelBuilder:
                     vr = vregs[u]
                     body.append(("valu", ("-", vr['t3_vec'], two_vec, vr['t2_vec'])))
                 
+                # Use multiply_add to combine idx = idx * 2 + t3
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], two_vec)))
-                
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("valu", ("+", vr['idx_vec'], vr['idx_vec'], vr['t3_vec'])))
+                    body.append(("valu", ("multiply_add", vr['idx_vec'], vr['idx_vec'], two_vec, vr['t3_vec'])))
                 
                 # PHASE 7: Wrap indices using pre-broadcast constant
                 for u in range(n):
