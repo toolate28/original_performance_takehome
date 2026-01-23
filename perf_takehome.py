@@ -187,7 +187,7 @@ class KernelBuilder:
         if len(bundles) <= 1:
             return bundles
         
-        LOOKAHEAD = 3  # Conservative lookahead
+        LOOKAHEAD = 10  # Aggressive lookahead for better packing
         
         # Precompute dependencies for all bundles
         bundle_deps = []
@@ -440,12 +440,14 @@ class KernelBuilder:
         # Allocate vector registers for unrolled iterations
         # Each vector register holds VLEN=8 elements  
         # Reuse t1_vec and t2_vec for hash computations to save scratch space
+        # Add separate address registers to cache computed addresses
         vregs = []
         for u in range(VEC_UNROLL):
             vregs.append({
                 'idx_vec': self.alloc_scratch(f"idx_vec{u}", VLEN),
                 'val_vec': self.alloc_scratch(f"val_vec{u}", VLEN),
-                'addr_base': self.alloc_scratch(f"addr_base{u}"),
+                'indices_addr': self.alloc_scratch(f"indices_addr{u}"),  # Cache for inp_indices_p + offset
+                'values_addr': self.alloc_scratch(f"values_addr{u}"),    # Cache for inp_values_p + offset
                 't1_vec': self.alloc_scratch(f"t1_vec{u}", VLEN),
                 't2_vec': self.alloc_scratch(f"t2_vec{u}", VLEN),
                 't3_vec': self.alloc_scratch(f"t3_vec{u}", VLEN),
@@ -508,33 +510,31 @@ class KernelBuilder:
             for vec_base in range(0, n_vec_groups, VEC_UNROLL):
                 n = min(VEC_UNROLL, n_vec_groups - vec_base)
                 
-                # PHASE 1: Vector load indices using pre-computed offsets
+                # PHASE 1: Compute and cache addresses, then vector load indices
+                # Compute addresses once and cache for later reuse in store phase
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
+                    body.append(("alu", ("+", vr['indices_addr'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
+                    body.append(("alu", ("+", vr['values_addr'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
                 
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("load", ("vload", vr['idx_vec'], vr['addr_base'])))
+                    body.append(("load", ("vload", vr['idx_vec'], vr['indices_addr'])))
                 
-                # PHASE 2: Vector load values using pre-computed offsets
+                # PHASE 2: Vector load values using cached addresses
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
-                
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("load", ("vload", vr['val_vec'], vr['addr_base'])))
+                    body.append(("load", ("vload", vr['val_vec'], vr['values_addr'])))
                 
                 # PHASE 3: Scalar indexed loads of node_val (can't vectorize)
-                # Calculate addresses directly from idx_vec
+                # Compute all addresses first (allows better ALU packing)
                 for u in range(n):
                     vr = vregs[u]
                     for vi in range(VLEN):
                         sr = scalar_regs[u * VLEN + vi]
                         body.append(("alu", ("+", sr['addr'], self.scratch["forest_values_p"], vr['idx_vec'] + vi)))
                 
-                # Load node values directly into t1_vec (no intermediate scalar register)
+                # Then do all loads (allows better load packing)
                 for u in range(n):
                     vr = vregs[u]
                     for vi in range(VLEN):
@@ -596,22 +596,15 @@ class KernelBuilder:
                     vr = vregs[u]
                     body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], vr['t1_vec'])))
                 
-                # PHASE 8: Vector store results using pre-computed offsets
+                # PHASE 8: Vector store results using cached addresses
+                # Reuse the addresses computed in Phase 1 instead of recomputing
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
+                    body.append(("store", ("vstore", vr['indices_addr'], vr['idx_vec'])))
                 
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("store", ("vstore", vr['addr_base'], vr['idx_vec'])))
-                
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
-                
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("store", ("vstore", vr['addr_base'], vr['val_vec'])))
+                    body.append(("store", ("vstore", vr['values_addr'], vr['val_vec'])))
 
         # Build with VLIW packing
         bundles = self.build(body)
