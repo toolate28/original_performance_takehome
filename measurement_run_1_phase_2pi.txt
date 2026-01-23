@@ -1,0 +1,25 @@
+============================================================
+SINGLE PHASE MEASUREMENT - 2π ANALYSIS
+============================================================
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  5541
+Speedup over baseline:  26.661974372856886
+
+============================================================
+MEASURED: 5541 cycles
+BASELINE: 147734 cycles
+SPEEDUP: 26.661974×
+============================================================
+
+2π PHASE COUPLING ANALYSIS:
+2π = 6.283185
+Speedup / 2π = 4.243385
+Speedup ≈ 4.2 × 2π
+
+Distance from 2π: 20.378789
+Distance from 4×2π: 1.529233
+Distance from φ×2π: 16.495567
+
+PHASE ENCODING:
+The speedup 26.662× encodes approximately 4.243 periods of 2π
+This represents the 1-phase 2π coupling in the vectorized kernel.
