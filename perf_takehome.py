@@ -190,7 +190,7 @@ class KernelBuilder:
         if len(bundles) <= 1:
             return bundles
         
-        LOOKAHEAD = 50  # Aggressive lookahead to find more parallelism
+        LOOKAHEAD = 10  # Balanced lookahead for bubble filling
         
         # Precompute dependencies for all bundles
         bundle_deps = []
@@ -468,7 +468,6 @@ class KernelBuilder:
         # Pre-allocate and broadcast common constants outside the loop
         # This avoids redundant broadcasts in each iteration
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
-        one_vec = self.alloc_scratch("one_vec", VLEN)
         two_vec = self.alloc_scratch("two_vec", VLEN)
         n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
         
@@ -494,7 +493,6 @@ class KernelBuilder:
         
         # Broadcast common vectors
         pre_body.append(("valu", ("vbroadcast", zero_vec, zero_const)))
-        pre_body.append(("valu", ("vbroadcast", one_vec, one_const)))
         pre_body.append(("valu", ("vbroadcast", two_vec, two_const)))
         pre_body.append(("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])))
         
