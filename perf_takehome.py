@@ -382,7 +382,7 @@ class KernelBuilder:
         5. Pre-compute addresses outside round loop to eliminate redundant ALU ops
         6. Aggressive bubble-fill lookahead (100) for maximum instruction packing
         """
-        # Optimal unroll factor for balanced ILP and packing efficiency  
+        # Optimal unroll factor for balanced ILP and packing efficiency
         UNROLL_FACTOR = 8
         
         tmp1 = self.alloc_scratch("tmp1")
@@ -503,7 +503,7 @@ class KernelBuilder:
         
         self.instrs.extend(self.build(pre_body))
 
-        #  Allocate address registers for loads/stores (computed once, reused across rounds)
+        # Allocate address registers for loads/stores (computed once, reused across rounds)
         addr_indices_load = []
         addr_values_load = []
         addr_indices_store = []
