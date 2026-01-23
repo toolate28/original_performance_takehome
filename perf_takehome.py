@@ -388,6 +388,10 @@ class KernelBuilder:
         UNROLL_FACTOR = 12
         ROUND_UNROLL = 2  # Unroll rounds to reduce loop overhead
         
+        # Rounds with high deduplication potential (for load optimization)
+        DEDUP_ROUNDS_100 = {0, 11}  # All 256 elements access same node (100% dedup)
+        DEDUP_ROUNDS_50 = {1, 12}   # Only 2 unique nodes accessed (50% dedup)
+        
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
@@ -440,17 +444,22 @@ class KernelBuilder:
         self.add("flow", ("pause",))
         self.add("debug", ("comment", "Starting SIMD loop"))
 
-        # Allocate vector registers for unrolled iterations
+        # Allocate vector registers for unrolled iterations with hash stage separation
         # Each vector register holds VLEN=8 elements
         vregs = []
         for u in range(UNROLL_FACTOR):
-            vregs.append({
+            vreg = {
                 'idx_vec': self.alloc_scratch(f"idx_vec{u}", VLEN),
                 'val_vec': self.alloc_scratch(f"val_vec{u}", VLEN),
                 't1_vec': self.alloc_scratch(f"t1_vec{u}", VLEN),
                 't2_vec': self.alloc_scratch(f"t2_vec{u}", VLEN),
                 't3_vec': self.alloc_scratch(f"t3_vec{u}", VLEN),
-            })
+            }
+            # Allocate separate val_vec for each hash stage to enable parallelization
+            vreg['hash_vals'] = []
+            for hi in range(len(HASH_STAGES)):
+                vreg['hash_vals'].append(self.alloc_scratch(f"hv{u}_{hi}", VLEN))
+            vregs.append(vreg)
         
         # Allocate scalar registers for the indexed loads (can't vectorize)
         scalar_regs = []
@@ -536,7 +545,7 @@ class KernelBuilder:
 
         for round_num in range(rounds):
             # Special optimization for rounds with few unique indices
-            if round_num == 0 or round_num == 11:
+            if round_num in DEDUP_ROUNDS_100:
                 # ALL indices are 0 - 100% deduplication
                 body.append(("load", ("load", shared_node_val, self.scratch["forest_values_p"])))
                 body.append(("valu", ("vbroadcast", shared_node_vec, shared_node_val)))
@@ -702,21 +711,28 @@ class KernelBuilder:
                     vr = vregs[u]
                     body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], vr['t1_vec'])))
                 
-                # PHASE 5: Vector hash using pre-broadcast constants
+                # PHASE 5: Vector hash with staged computation
+                # Use separate val_vec for each stage except last to reduce WAR hazards
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     hv = hash_const_vecs[hi]
+                    is_last = (hi == len(HASH_STAGES) - 1)
                     
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("valu", (op1, vr['t1_vec'], vr['val_vec'], hv['c1_vec'])))
+                        src = vr['val_vec'] if hi == 0 else vr['hash_vals'][hi-1]
+                        body.append(("valu", (op1, vr['t1_vec'], src, hv['c1_vec'])))
                     
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("valu", (op3, vr['t2_vec'], vr['val_vec'], hv['c3_vec'])))
+                        src = vr['val_vec'] if hi == 0 else vr['hash_vals'][hi-1]
+                        body.append(("valu", (op3, vr['t2_vec'], src, hv['c3_vec'])))
                     
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("valu", (op2, vr['val_vec'], vr['t1_vec'], vr['t2_vec'])))
+                        # Last stage writes to val_vec, others to staging area
+                        dest = vr['val_vec'] if is_last else vr['hash_vals'][hi]
+                        body.append(("valu", (op2, dest, vr['t1_vec'], vr['t2_vec'])))
+
                 
                 # PHASE 6: Update indices using multiply_add fusion
                 # Fuse: idx = idx * 2 + offset (where offset = 2 - (val%2==0))
