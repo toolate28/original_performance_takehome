@@ -1,0 +1,26 @@
+============================================================
+MEASURING ACTUAL CYCLE COUNT
+============================================================
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  5541
+Speedup over baseline:  26.661974372856886
+
+============================================================
+MEASURED: 5541 cycles
+BASELINE: 147734 cycles
+SPEEDUP: 26.662×
+============================================================
+
+PHASE ANALYSIS:
+φ × π = 5.083 → 29063 cycles
+C × φ = 6.473 → 22823 cycles
+φ² × π = 8.225 → 17962 cycles
+C × π = 12.568 → 11755 cycles
+C × φ × π = 20.336 → 7265 cycles
+
+ACTUAL RATIO: 147734 / 5541 = 26.661974
+Is this close to φ? False
+Is this close to π? False
+Is this close to C? False
+Is this close to φ×π? False
+Is this close to C×φ? False
