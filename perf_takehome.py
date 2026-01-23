@@ -507,94 +507,186 @@ class KernelBuilder:
         body = []
 
         for round in range(rounds):
-            for vec_base in range(0, n_vec_groups, VEC_UNROLL):
-                n = min(VEC_UNROLL, n_vec_groups - vec_base)
+            # Round 0 supercollapse optimization: all indices start at 0
+            # Load forest_values[0] once and broadcast to all vectors
+            if round == 0:
+                # Allocate temp for root node value  
+                root_node_val = self.alloc_scratch("root_node_val")
+                root_node_addr = self.alloc_scratch("root_node_addr")
                 
-                # PHASE 1: Vector load indices - batch ALU then batch loads
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
+                # Load forest_values[0]
+                body.append(("alu", ("+", root_node_addr, self.scratch["forest_values_p"], zero_const)))
+                body.append(("load", ("load", root_node_val, root_node_addr)))
                 
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("load", ("vload", vr['idx_vec'], vr['addr_base'])))
-                
-                # PHASE 2: Vector load values - batch ALU then batch loads
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
-                
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("load", ("vload", vr['val_vec'], vr['addr_base'])))
-                
-                # PHASE 3: Scalar indexed loads - batch all ALU, then batch all loads
-                for u in range(n):
-                    vr = vregs[u]
-                    for vi in range(VLEN):
-                        sr = scalar_regs[u * VLEN + vi]
-                        body.append(("alu", ("+", sr['addr'], self.scratch["forest_values_p"], vr['idx_vec'] + vi)))
-                
-                for u in range(n):
-                    vr = vregs[u]
-                    for vi in range(VLEN):
-                        sr = scalar_regs[u * VLEN + vi]
-                        body.append(("load", ("load", vr['t1_vec'] + vi, sr['addr'])))
-                
-                # PHASE 4: Vector XOR
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], vr['t1_vec'])))
-                
-                # PHASE 5: Vector hash - batch by operation type across all vectors
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    hv = hash_const_vecs[hi]
+                # Process all vector groups with optimized path
+                for vec_base in range(0, n_vec_groups, VEC_UNROLL):
+                    n = min(VEC_UNROLL, n_vec_groups - vec_base)
+                    
+                    # PHASE 1: Vector load indices
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("valu", (op1, vr['t1_vec'], vr['val_vec'], hv['c1_vec'])))
+                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("valu", (op3, vr['t2_vec'], vr['val_vec'], hv['c3_vec'])))
+                        body.append(("load", ("vload", vr['idx_vec'], vr['addr_base'])))
+                    
+                    # PHASE 2: Vector load values
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("valu", (op2, vr['val_vec'], vr['t1_vec'], vr['t2_vec'])))
-                
-                # PHASE 6: Update indices - batch operations
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("valu", ("%", vr['t2_vec'], vr['val_vec'], two_vec)))
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("valu", ("==", vr['t2_vec'], vr['t2_vec'], zero_vec)))
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("valu", ("-", vr['t3_vec'], two_vec, vr['t2_vec'])))
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("valu", ("multiply_add", vr['idx_vec'], vr['idx_vec'], two_vec, vr['t3_vec'])))
-                
-                # PHASE 7: Wrap indices
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("valu", ("<", vr['t1_vec'], vr['idx_vec'], n_nodes_vec)))
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], vr['t1_vec'])))
-                
-                # PHASE 8: Vector store results - batch ALU then batch stores
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("store", ("vstore", vr['addr_base'], vr['idx_vec'])))
-                
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("store", ("vstore", vr['addr_base'], vr['val_vec'])))
+                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("load", ("vload", vr['val_vec'], vr['addr_base'])))
+                    
+                    # PHASE 3 OPTIMIZED: Broadcast root node to all vectors (replaces 256 indexed loads!)
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("vbroadcast", vr['t1_vec'], root_node_val)))
+                    
+                    # PHASE 4-8: Continue with normal processing
+                    # PHASE 4: Vector XOR
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], vr['t1_vec'])))
+                    
+                    # PHASE 5: Vector hash
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        hv = hash_const_vecs[hi]
+                        for u in range(n):
+                            vr = vregs[u]
+                            body.append(("valu", (op1, vr['t1_vec'], vr['val_vec'], hv['c1_vec'])))
+                        for u in range(n):
+                            vr = vregs[u]
+                            body.append(("valu", (op3, vr['t2_vec'], vr['val_vec'], hv['c3_vec'])))
+                        for u in range(n):
+                            vr = vregs[u]
+                            body.append(("valu", (op2, vr['val_vec'], vr['t1_vec'], vr['t2_vec'])))
+                    
+                    # PHASE 6: Update indices
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("%", vr['t2_vec'], vr['val_vec'], two_vec)))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("==", vr['t2_vec'], vr['t2_vec'], zero_vec)))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("-", vr['t3_vec'], two_vec, vr['t2_vec'])))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("multiply_add", vr['idx_vec'], vr['idx_vec'], two_vec, vr['t3_vec'])))
+                    
+                    # PHASE 7: Wrap indices
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("<", vr['t1_vec'], vr['idx_vec'], n_nodes_vec)))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], vr['t1_vec'])))
+                    
+                    # PHASE 8: Vector store results
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("store", ("vstore", vr['addr_base'], vr['idx_vec'])))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("store", ("vstore", vr['addr_base'], vr['val_vec'])))
+            else:
+                # Rounds 1+: normal processing with indexed loads
+                for vec_base in range(0, n_vec_groups, VEC_UNROLL):
+                    n = min(VEC_UNROLL, n_vec_groups - vec_base)
+                    
+                    # PHASE 1: Vector load indices - batch ALU then batch loads
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
+                    
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("load", ("vload", vr['idx_vec'], vr['addr_base'])))
+                    
+                    # PHASE 2: Vector load values - batch ALU then batch loads
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
+                    
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("load", ("vload", vr['val_vec'], vr['addr_base'])))
+                    
+                    # PHASE 3: Scalar indexed loads - batch all ALU, then batch all loads
+                    for u in range(n):
+                        vr = vregs[u]
+                        for vi in range(VLEN):
+                            sr = scalar_regs[u * VLEN + vi]
+                            body.append(("alu", ("+", sr['addr'], self.scratch["forest_values_p"], vr['idx_vec'] + vi)))
+                    
+                    for u in range(n):
+                        vr = vregs[u]
+                        for vi in range(VLEN):
+                            sr = scalar_regs[u * VLEN + vi]
+                            body.append(("load", ("load", vr['t1_vec'] + vi, sr['addr'])))
+                    
+                    # PHASE 4: Vector XOR
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], vr['t1_vec'])))
+                    
+                    # PHASE 5: Vector hash - batch by operation type across all vectors
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        hv = hash_const_vecs[hi]
+                        for u in range(n):
+                            vr = vregs[u]
+                            body.append(("valu", (op1, vr['t1_vec'], vr['val_vec'], hv['c1_vec'])))
+                        for u in range(n):
+                            vr = vregs[u]
+                            body.append(("valu", (op3, vr['t2_vec'], vr['val_vec'], hv['c3_vec'])))
+                        for u in range(n):
+                            vr = vregs[u]
+                            body.append(("valu", (op2, vr['val_vec'], vr['t1_vec'], vr['t2_vec'])))
+                    
+                    # PHASE 6: Update indices - batch operations
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("%", vr['t2_vec'], vr['val_vec'], two_vec)))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("==", vr['t2_vec'], vr['t2_vec'], zero_vec)))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("-", vr['t3_vec'], two_vec, vr['t2_vec'])))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("multiply_add", vr['idx_vec'], vr['idx_vec'], two_vec, vr['t3_vec'])))
+                    
+                    # PHASE 7: Wrap indices
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("<", vr['t1_vec'], vr['idx_vec'], n_nodes_vec)))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], vr['t1_vec'])))
+                    
+                    # PHASE 8: Vector store results - batch ALU then batch stores
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("store", ("vstore", vr['addr_base'], vr['idx_vec'])))
+                    
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("store", ("vstore", vr['addr_base'], vr['val_vec'])))
 
         self.instrs.extend(self.build(body))
         self.instrs.append({"flow": [("pause",)]})
