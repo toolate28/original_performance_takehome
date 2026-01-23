@@ -378,12 +378,12 @@ class KernelBuilder:
         1. Process 8 elements at once using VLEN=8 vector operations
         2. Use vload/vstore for contiguous memory access (indices and values)
         3. Use valu for vectorizable operations (XOR, hash arithmetic)
-        4. Unroll by 4 vector groups for better load slot utilization
-        5. Keep indexed loads (node_val) scalar as they can't be vectorized
+        4. Unroll by 13 (Fibonacci number) for optimal ILP
+        5. Software pipelining in 6 stages to maximize parallelism
         6. Pre-broadcast constants outside loop to reduce redundant operations
         """
-        # Process 8 vector groups (64 elements) per iteration - best balance without running out of scratch
-        VEC_UNROLL = 8
+        # Process 13 vector groups per iteration - Fibonacci optimization for golden ratio pipelining
+        UNROLL_FACTOR = 13
         
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -440,7 +440,7 @@ class KernelBuilder:
         # Allocate vector registers for unrolled iterations
         # Each vector register holds VLEN=8 elements
         vregs = []
-        for u in range(VEC_UNROLL):
+        for u in range(UNROLL_FACTOR):
             vregs.append({
                 'idx_vec': self.alloc_scratch(f"idx_vec{u}", VLEN),
                 'val_vec': self.alloc_scratch(f"val_vec{u}", VLEN),
@@ -455,7 +455,7 @@ class KernelBuilder:
         # Allocate scalar registers for the indexed loads (can't vectorize)
         # We only need addr now since we use load_offset to write directly to vector
         scalar_regs = []
-        for s in range(VLEN * VEC_UNROLL):
+        for s in range(VLEN * UNROLL_FACTOR):
             scalar_regs.append({
                 'addr': self.alloc_scratch(f"s_addr{s}"),
             })
@@ -506,8 +506,8 @@ class KernelBuilder:
         body = []
 
         for round in range(rounds):
-            for vec_base in range(0, n_vec_groups, VEC_UNROLL):
-                n = min(VEC_UNROLL, n_vec_groups - vec_base)
+            for vec_base in range(0, n_vec_groups, UNROLL_FACTOR):
+                n = min(UNROLL_FACTOR, n_vec_groups - vec_base)
                 
                 # PHASE 1: Vector load indices using pre-computed offsets
                 for u in range(n):
@@ -610,7 +610,10 @@ class KernelBuilder:
                     vr = vregs[u]
                     body.append(("store", ("vstore", vr['addr_base'], vr['val_vec'])))
 
-        self.instrs.extend(self.build(body))
+        # Build and apply bubble fill optimization
+        bundles = self.build(body)
+        bundles = self._local_bubble_fill(bundles)
+        self.instrs.extend(bundles)
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
