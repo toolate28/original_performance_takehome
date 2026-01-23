@@ -187,7 +187,7 @@ class KernelBuilder:
         if len(bundles) <= 1:
             return bundles
         
-        LOOKAHEAD = 10  # Aggressive lookahead for better packing
+        LOOKAHEAD = 10  # Optimal lookahead for packing
         
         # Precompute dependencies for all bundles
         bundle_deps = []
@@ -374,15 +374,16 @@ class KernelBuilder:
     ):
         """
         Highly optimized VLIW SIMD kernel with:
-        1. Fibonacci-weighted unrolling (VEC_UNROLL=13 for golden resonance)
-        2. Hash phason grouping (group all op1, all op3, all op2)
-        3. Pre-allocated constants and addresses
-        4. Optimized register allocation with reuse
-        5. Software pipelined stages for maximum ILP
-        6. Bubble-fill post-optimization for better packing
+        1. SIMD vectorization with VLEN=8 vector operations
+        2. VEC_UNROLL=8 for balanced ILP and scratch space usage
+        3. Address caching to reuse computed addresses
+        4. Hash operation grouping by type within stages
+        5. Pre-allocated constants hoisted outside loops
+        6. Bubble-fill optimization for better bundle packing
+        7. Software pipelined stages for maximum parallelism
         """
-        # Fibonacci unroll factor for golden resonance and maximum ILP
-        # Balance between ILP and scratch space (SCRATCH_SIZE=1536)
+        # Unroll factor balancing ILP and scratch space (SCRATCH_SIZE=1536)
+        # 8 provides optimal balance with 4 iterations per round
         VEC_UNROLL = 8
         
         tmp1 = self.alloc_scratch("tmp1")
@@ -450,7 +451,6 @@ class KernelBuilder:
                 'values_addr': self.alloc_scratch(f"values_addr{u}"),    # Cache for inp_values_p + offset
                 't1_vec': self.alloc_scratch(f"t1_vec{u}", VLEN),
                 't2_vec': self.alloc_scratch(f"t2_vec{u}", VLEN),
-                't3_vec': self.alloc_scratch(f"t3_vec{u}", VLEN),
             })
         
         # Allocate scalar registers for the indexed loads (can't vectorize)
@@ -467,6 +467,7 @@ class KernelBuilder:
         # Pre-allocate and broadcast common constants outside the loop
         # This avoids redundant broadcasts in each iteration
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
+        one_vec = self.alloc_scratch("one_vec", VLEN)
         two_vec = self.alloc_scratch("two_vec", VLEN)
         n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
         
@@ -493,6 +494,7 @@ class KernelBuilder:
         
         # Broadcast common vectors
         pre_body.append(("valu", ("vbroadcast", zero_vec, zero_const)))
+        pre_body.append(("valu", ("vbroadcast", one_vec, one_const)))
         pre_body.append(("valu", ("vbroadcast", two_vec, two_const)))
         pre_body.append(("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])))
         
@@ -566,26 +568,29 @@ class KernelBuilder:
                         vr = vregs[u]
                         body.append(("valu", (op2, vr['val_vec'], vr['t1_vec'], vr['t2_vec'])))
                 
-                # PHASE 6: Update indices using pre-broadcast constants
+                # PHASE 6: Update indices using optimized formula
+                # new_idx = idx*2 + 1 + (val % 2)
+                # This saves one operation compared to the original 5-operation sequence
+                
+                # Compute val % 2 (0 if even, 1 if odd)
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("valu", ("%", vr['t2_vec'], vr['val_vec'], two_vec)))
                 
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("valu", ("==", vr['t2_vec'], vr['t2_vec'], zero_vec)))
-                
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("valu", ("-", vr['t3_vec'], two_vec, vr['t2_vec'])))
-                
+                # Multiply idx by 2
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], two_vec)))
                 
+                # Add 1
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("valu", ("+", vr['idx_vec'], vr['idx_vec'], vr['t3_vec'])))
+                    body.append(("valu", ("+", vr['idx_vec'], vr['idx_vec'], one_vec)))
+                
+                # Add (val % 2)
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("valu", ("+", vr['idx_vec'], vr['idx_vec'], vr['t2_vec'])))
                 
                 # PHASE 7: Wrap indices using pre-broadcast constant
                 for u in range(n):
