@@ -187,7 +187,7 @@ class KernelBuilder:
         if len(bundles) <= 1:
             return bundles
         
-        LOOKAHEAD = 4  # Conservative lookahead
+        LOOKAHEAD = 4  # Lookahead window for bubble filling
         
         # Precompute dependencies for all bundles
         bundle_deps = []
@@ -202,7 +202,7 @@ class KernelBuilder:
             bundle_deps.append((reads, writes))
         
         # Multiple passes for better packing
-        for pass_num in range(2):  # Conservative passes
+        for _ in range(2):  # Two passes to maximize bubble filling
             for i in range(len(bundles)):
                 # Calculate current slot usage
                 slot_usage = {e: 0 for e in SLOT_LIMITS}
@@ -374,13 +374,14 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Highly optimized SIMD vectorized kernel with software pipelining across rounds.
+        Highly optimized SIMD vectorized kernel.
         Key optimizations:
-        1. Software pipelining: overlap load/compute/store from different rounds
-        2. Maximum VEC_UNROLL to reduce iterations
-        3. Use multiply_add to fuse operations in hash
-        4. Aggressive scratch reuse
+        1. Process 8 elements per vector using vload/vstore/valu
+        2. VEC_UNROLL=16 to reduce iteration overhead (128 elements per iteration)
+        3. Use multiply_add to fuse operations
+        4. Aggressive scratch space reuse
         5. Pre-broadcast all constants outside loops
+        6. Dependency-aware VLIW bundling with bubble fill
         """
         VEC_UNROLL = 16
         
