@@ -527,20 +527,33 @@ class KernelBuilder:
                     vr = vregs[u]
                     body.append(("load", ("vload", vr['val_vec'], vr['addr_base'])))
                 
-                # PHASE 3: Scalar indexed loads of node_val (can't vectorize)
-                # Calculate addresses directly from idx_vec
-                for u in range(n):
-                    vr = vregs[u]
-                    for vi in range(VLEN):
-                        sr = scalar_regs[u * VLEN + vi]
-                        body.append(("alu", ("+", sr['addr'], self.scratch["forest_values_p"], vr['idx_vec'] + vi)))
-                
-                # Load node values directly into t1_vec (no intermediate scalar register)
-                for u in range(n):
-                    vr = vregs[u]
-                    for vi in range(VLEN):
-                        sr = scalar_regs[u * VLEN + vi]
-                        body.append(("load", ("load", vr['t1_vec'] + vi, sr['addr'])))
+                # PHASE 3: Load node values - phase-aware optimization
+                # Round 0: 100% convergence (all indices = 0) → supercollapse
+                # Round 1+: Exponential divergence → standard indexed loads
+                if round == 0:
+                    # SUPERCOLLAPSE: Load forest[0] once and broadcast to all vectors
+                    # This replaces 256 indexed loads with 1 load + N broadcasts
+                    # Load forest[0] once into a scalar register
+                    body.append(("load", ("load", tmp1, self.scratch["forest_values_p"])))
+                    # Broadcast to all vectors
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("vbroadcast", vr['t1_vec'], tmp1)))
+                else:
+                    # STANDARD: Scalar indexed loads (post-phase-boundary)
+                    # Calculate addresses directly from idx_vec
+                    for u in range(n):
+                        vr = vregs[u]
+                        for vi in range(VLEN):
+                            sr = scalar_regs[u * VLEN + vi]
+                            body.append(("alu", ("+", sr['addr'], self.scratch["forest_values_p"], vr['idx_vec'] + vi)))
+                    
+                    # Load node values directly into t1_vec
+                    for u in range(n):
+                        vr = vregs[u]
+                        for vi in range(VLEN):
+                            sr = scalar_regs[u * VLEN + vi]
+                            body.append(("load", ("load", vr['t1_vec'] + vi, sr['addr'])))
                 
                 # PHASE 4: Vector XOR - t1_vec now contains nval, XOR with val_vec
                 for u in range(n):
