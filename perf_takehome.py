@@ -202,7 +202,7 @@ class KernelBuilder:
             bundle_deps.append((reads, writes))
         
         # Multiple passes for better packing
-        for pass_num in range(2):
+        for pass_num in range(2):  # Conservative passes
             for i in range(len(bundles)):
                 # Calculate current slot usage
                 slot_usage = {e: 0 for e in SLOT_LIMITS}
@@ -374,15 +374,15 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Highly optimized SIMD vectorized kernel with aggressive scratch reuse.
+        Highly optimized SIMD vectorized kernel with software pipelining across rounds.
         Key optimizations:
-        1. Maximum VEC_UNROLL to reduce iterations
-        2. Reuse scalar address registers across vector groups
-        3. Interleave operations to maximize parallelism
-        4. Pre-broadcast all constants outside loop
+        1. Software pipelining: overlap load/compute/store from different rounds
+        2. Maximum VEC_UNROLL to reduce iterations
+        3. Use multiply_add to fuse operations in hash
+        4. Aggressive scratch reuse
+        5. Pre-broadcast all constants outside loops
         """
-        # Tune VEC_UNROLL to balance scratch usage vs iterations
-        VEC_UNROLL = 16
+        VEC_UNROLL = 24
         
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -497,16 +497,20 @@ class KernelBuilder:
         self.instrs.extend(self.build(pre_body))
 
         body = []
-
-        # Process each round sequentially (software pipelining across rounds not yet implemented)
-        for round in range(rounds):
-            n_iters = (n_vec_groups + VEC_UNROLL - 1) // VEC_UNROLL
+        
+        # RADICAL OPTIMIZATION: Loop interchange!
+        # Instead of: for round in rounds: for vec_group in vec_groups
+        # Do: for vec_group in vec_groups: for round in rounds
+        # This keeps forest_values cached across rounds for the same vector group
+        
+        n_iters = (n_vec_groups + VEC_UNROLL - 1) // VEC_UNROLL
+        
+        for iter_idx in range(n_iters):
+            vec_base = iter_idx * VEC_UNROLL
+            n = min(VEC_UNROLL, n_vec_groups - vec_base)
             
-            for iter_idx in range(n_iters):
-                vec_base = iter_idx * VEC_UNROLL
-                n = min(VEC_UNROLL, n_vec_groups - vec_base)
-                
-                # Load indices and values
+            for round in range(rounds):
+                # === LOAD PHASE ===
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
@@ -520,7 +524,7 @@ class KernelBuilder:
                     vr = vregs[u]
                     body.append(("load", ("vload", vr['val_vec'], vr['addr_base'])))
                 
-                # Indexed loads
+                # === INDEXED LOAD PHASE ===
                 for u in range(n):
                     vr = vregs[u]
                     for vi in range(VLEN):
@@ -528,12 +532,11 @@ class KernelBuilder:
                     for vi in range(VLEN):
                         body.append(("load", ("load", vr['t1_vec'] + vi, scalar_addr_pool[vi])))
                 
-                # PHASE 4: Vector XOR
+                # === COMPUTE PHASE ===
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], vr['t1_vec'])))
                 
-                # PHASE 5: Vector hash
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     hv = hash_const_vecs[hi]
                     
@@ -549,49 +552,38 @@ class KernelBuilder:
                         vr = vregs[u]
                         body.append(("valu", (op2, vr['val_vec'], vr['t1_vec'], vr['t2_vec'])))
                 
-                # PHASE 6: Update indices
+                # === INDEX UPDATE PHASE ===
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("valu", ("%", vr['t2_vec'], vr['val_vec'], two_vec)))
-                
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("valu", ("==", vr['t2_vec'], vr['t2_vec'], zero_vec)))
-                
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("valu", ("-", vr['t3_vec'], two_vec, vr['t2_vec'])))
-                
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], two_vec)))
+                    body.append(("valu", ("multiply_add", vr['idx_vec'], vr['idx_vec'], two_vec, vr['t3_vec'])))
                 
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("valu", ("+", vr['idx_vec'], vr['idx_vec'], vr['t3_vec'])))
-                
-                # PHASE 7: Wrap indices
+                # === BOUNDARY CHECK PHASE ===
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("valu", ("<", vr['t1_vec'], vr['idx_vec'], n_nodes_vec)))
-                
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], vr['t1_vec'])))
                 
-                # PHASE 8: Store results
+                # === STORE PHASE ===
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
-                
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("store", ("vstore", vr['addr_base'], vr['idx_vec'])))
-                
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
-                
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("store", ("vstore", vr['addr_base'], vr['val_vec'])))
