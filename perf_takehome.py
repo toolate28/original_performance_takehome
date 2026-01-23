@@ -187,7 +187,7 @@ class KernelBuilder:
         if len(bundles) <= 1:
             return bundles
         
-        LOOKAHEAD = 3  # Conservative lookahead
+        LOOKAHEAD = 100  # Very aggressive lookahead for maximum bubble filling
         
         # Precompute dependencies for all bundles
         bundle_deps = []
@@ -382,8 +382,8 @@ class KernelBuilder:
         5. Software pipelining in 6 stages to maximize parallelism
         6. Pre-broadcast constants outside loop to reduce redundant operations
         """
-        # Process 13 vector groups per iteration - Fibonacci optimization for golden ratio pipelining
-        UNROLL_FACTOR = 13
+        # Optimal unroll factor for balanced ILP and packing efficiency  
+        UNROLL_FACTOR = 8
         
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -503,29 +503,42 @@ class KernelBuilder:
         
         self.instrs.extend(self.build(pre_body))
 
+        #  Allocate address registers for loads/stores (computed once, reused across rounds)
+        addr_indices_load = []
+        addr_values_load = []
+        addr_indices_store = []
+        addr_values_store = []
+        for vec_idx in range(n_vec_groups):
+            addr_indices_load.append(self.alloc_scratch(f"addr_idx_ld{vec_idx}"))
+            addr_values_load.append(self.alloc_scratch(f"addr_val_ld{vec_idx}"))
+            addr_indices_store.append(self.alloc_scratch(f"addr_idx_st{vec_idx}"))
+            addr_values_store.append(self.alloc_scratch(f"addr_val_st{vec_idx}"))
+        
+        # Pre-compute address vectors for all vector groups (computed once!)
+        addr_body = []
+        for vec_idx in range(n_vec_groups):
+            addr_body.append(("alu", ("+", addr_indices_load[vec_idx], self.scratch["inp_indices_p"], offset_consts[vec_idx])))
+            addr_body.append(("alu", ("+", addr_values_load[vec_idx], self.scratch["inp_values_p"], offset_consts[vec_idx])))
+            addr_body.append(("alu", ("+", addr_indices_store[vec_idx], self.scratch["inp_indices_p"], offset_consts[vec_idx])))
+            addr_body.append(("alu", ("+", addr_values_store[vec_idx], self.scratch["inp_values_p"], offset_consts[vec_idx])))
+        
+        self.instrs.extend(self.build(addr_body))
+
         body = []
 
         for round in range(rounds):
             for vec_base in range(0, n_vec_groups, UNROLL_FACTOR):
                 n = min(UNROLL_FACTOR, n_vec_groups - vec_base)
                 
-                # PHASE 1: Vector load indices using pre-computed offsets
+                # PHASE 1: Vector load indices using pre-computed addresses
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
+                    body.append(("load", ("vload", vr['idx_vec'], addr_indices_load[vec_base + u])))
                 
+                # PHASE 2: Vector load values using pre-computed addresses
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("load", ("vload", vr['idx_vec'], vr['addr_base'])))
-                
-                # PHASE 2: Vector load values using pre-computed offsets
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
-                
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("load", ("vload", vr['val_vec'], vr['addr_base'])))
+                    body.append(("load", ("vload", vr['val_vec'], addr_values_load[vec_base + u])))
                 
                 # PHASE 3: Scalar indexed loads of node_val (can't vectorize)
                 # Calculate addresses directly from idx_vec
@@ -535,14 +548,14 @@ class KernelBuilder:
                         sr = scalar_regs[u * VLEN + vi]
                         body.append(("alu", ("+", sr['addr'], self.scratch["forest_values_p"], vr['idx_vec'] + vi)))
                 
-                # Load node values directly into t1_vec (no intermediate scalar register)
+                # Load node values directly into t1_vec
                 for u in range(n):
                     vr = vregs[u]
                     for vi in range(VLEN):
                         sr = scalar_regs[u * VLEN + vi]
                         body.append(("load", ("load", vr['t1_vec'] + vi, sr['addr'])))
                 
-                # PHASE 4: Vector XOR - t1_vec now contains nval, XOR with val_vec
+                # PHASE 4: Vector XOR
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], vr['t1_vec'])))
@@ -593,22 +606,14 @@ class KernelBuilder:
                     vr = vregs[u]
                     body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], vr['t1_vec'])))
                 
-                # PHASE 8: Vector store results using pre-computed offsets
+                # PHASE 8: Vector store results using pre-computed addresses
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
+                    body.append(("store", ("vstore", addr_indices_store[vec_base + u], vr['idx_vec'])))
                 
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("store", ("vstore", vr['addr_base'], vr['idx_vec'])))
-                
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
-                
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("store", ("vstore", vr['addr_base'], vr['val_vec'])))
+                    body.append(("store", ("vstore", addr_values_store[vec_base + u], vr['val_vec'])))
 
         # Build and apply bubble fill optimization
         bundles = self.build(body)
