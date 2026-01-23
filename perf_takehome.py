@@ -177,6 +177,9 @@ class KernelBuilder:
         if current_bundle:
             instrs.append(current_bundle)
         
+        # Apply bubble filling optimization
+        instrs = self._local_bubble_fill(instrs)
+        
         return instrs
     
     def _local_bubble_fill(self, bundles: list[dict]) -> list[dict]:
@@ -187,7 +190,7 @@ class KernelBuilder:
         if len(bundles) <= 1:
             return bundles
         
-        LOOKAHEAD = 3  # Conservative lookahead
+        LOOKAHEAD = 10  # More aggressive lookahead to find parallelism
         
         # Precompute dependencies for all bundles
         bundle_deps = []
@@ -382,7 +385,7 @@ class KernelBuilder:
         5. Keep indexed loads (node_val) scalar as they can't be vectorized
         6. Pre-broadcast constants outside loop to reduce redundant operations
         """
-        # Process 8 vector groups (64 elements) per iteration - best balance without running out of scratch
+        # Process 8 vector groups (64 elements) per iteration - best balance
         VEC_UNROLL = 8
         
         tmp1 = self.alloc_scratch("tmp1")
