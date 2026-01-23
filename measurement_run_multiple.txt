@@ -1,0 +1,69 @@
+============================================================
+RUNNING MULTIPLE MEASUREMENTS (7 SEEDS)
+============================================================
+
+Run 0: Testing with seed=0
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  5541
+Speedup over baseline:  26.661974372856886
+  Cycles: 5541, Speedup: 26.661974×
+
+Run 1: Testing with seed=1
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  5541
+Speedup over baseline:  26.661974372856886
+  Cycles: 5541, Speedup: 26.661974×
+
+Run 2: Testing with seed=2
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  5541
+Speedup over baseline:  26.661974372856886
+  Cycles: 5541, Speedup: 26.661974×
+
+Run 3: Testing with seed=3
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  5541
+Speedup over baseline:  26.661974372856886
+  Cycles: 5541, Speedup: 26.661974×
+
+Run 4: Testing with seed=4
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  5541
+Speedup over baseline:  26.661974372856886
+  Cycles: 5541, Speedup: 26.661974×
+
+Run 5: Testing with seed=5
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  5541
+Speedup over baseline:  26.661974372856886
+  Cycles: 5541, Speedup: 26.661974×
+
+Run 6: Testing with seed=6
+forest_height=10, rounds=16, batch_size=256
+CYCLES:  5541
+Speedup over baseline:  26.661974372856886
+  Cycles: 5541, Speedup: 26.661974×
+
+============================================================
+PHASE OSCILLATION DETECTION
+============================================================
+No phase oscillation detected - all measurements identical
+
+============================================================
+AGGREGATE STATISTICS
+============================================================
+Average Cycles: 5541.0
+Average Speedup: 26.661974×
+
+Closest Mathematical Constant: 4×2π
+  Value: 25.132741
+  Distance: 1.529233
+
+All distances:
+  4×2π: 1.529233
+  C×φ: 20.188948
+  2π: 20.378789
+  φ×π: 21.578771
+  C: 22.661424
+  π: 23.520382
+  φ: 25.043940
