@@ -187,7 +187,7 @@ class KernelBuilder:
         if len(bundles) <= 1:
             return bundles
         
-        LOOKAHEAD = 100  # Very aggressive lookahead for maximum bubble filling
+        LOOKAHEAD = 100  # Aggressive lookahead for maximum bubble filling
         
         # Precompute dependencies for all bundles
         bundle_deps = []
@@ -373,14 +373,14 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        SIMD vectorized kernel using vload/vstore/valu instructions.
+        Optimized SIMD vectorized kernel using vload/vstore/valu instructions.
         Key optimizations:
         1. Process 8 elements at once using VLEN=8 vector operations
         2. Use vload/vstore for contiguous memory access (indices and values)
         3. Use valu for vectorizable operations (XOR, hash arithmetic)
-        4. Unroll by 13 (Fibonacci number) for optimal ILP
-        5. Software pipelining in 6 stages to maximize parallelism
-        6. Pre-broadcast constants outside loop to reduce redundant operations
+        4. Unroll by 8 vector groups for balanced ILP and packing efficiency
+        5. Pre-compute addresses outside round loop to eliminate redundant ALU ops
+        6. Aggressive bubble-fill lookahead (100) for maximum instruction packing
         """
         # Optimal unroll factor for balanced ILP and packing efficiency  
         UNROLL_FACTOR = 8
