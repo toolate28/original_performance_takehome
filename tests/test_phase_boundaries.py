@@ -18,7 +18,10 @@ import unittest
 import random
 from hypothesis import given, strategies as st, settings
 
-from problem import Tree, Input, build_mem_image, reference_kernel2, VLEN, N_CORES
+from problem import (
+    Tree, Input, build_mem_image, reference_kernel2, reference_kernel,
+    VLEN, N_CORES, Machine, DebugInfo
+)
 from perf_takehome import KernelBuilder
 
 
@@ -90,7 +93,6 @@ class TestPhaseBoundaries(unittest.TestCase):
         inp = Input.generate(forest, batch_size, rounds)
         
         # Use the actual reference_kernel function to simulate rounds
-        from problem import reference_kernel
         reference_kernel(forest, inp)  # This modifies inp in place
         
         # After all rounds, verify there's some divergence
@@ -117,21 +119,21 @@ class TestPhaseBoundaries(unittest.TestCase):
         kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
         
         # Run optimized kernel
-        from problem import Machine, DebugInfo
         machine = Machine(mem, kb.instrs, kb.debug_info(), n_cores=N_CORES)
         machine.enable_pause = False
         machine.enable_debug = False
         machine.run()
         
-        # Run reference kernel
+        # Run reference kernel to completion and get final memory state
+        final_mem = None
         for ref_mem in reference_kernel2(mem):
-            pass
+            final_mem = ref_mem
         
         # Verify outputs match
-        inp_values_p = ref_mem[6]
+        inp_values_p = final_mem[6]
         self.assertEqual(
             machine.mem[inp_values_p : inp_values_p + len(inp.values)],
-            ref_mem[inp_values_p : inp_values_p + len(inp.values)],
+            final_mem[inp_values_p : inp_values_p + len(inp.values)],
             "Optimized kernel should produce same results as reference"
         )
     
@@ -148,7 +150,6 @@ class TestPhaseBoundaries(unittest.TestCase):
         kb = KernelBuilder()
         kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
         
-        from problem import Machine
         machine = Machine(mem, kb.instrs, kb.debug_info(), n_cores=N_CORES)
         machine.enable_pause = False
         machine.enable_debug = False
