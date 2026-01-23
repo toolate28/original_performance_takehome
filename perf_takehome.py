@@ -181,13 +181,13 @@ class KernelBuilder:
     
     def _local_bubble_fill(self, bundles: list[dict]) -> list[dict]:
         """
-        Conservative local optimization: look ahead a few bundles and try to pull
-        instructions to fill bubbles while carefully checking ALL dependencies.
+        Aggressive local optimization: look ahead many bundles and try to pull
+        ALL possible instructions to fill bubbles while checking dependencies.
         """
         if len(bundles) <= 1:
             return bundles
         
-        LOOKAHEAD = 10  # Optimal lookahead for packing
+        LOOKAHEAD = 50  # Balanced lookahead for good packing with reasonable compile time
         
         # Precompute dependencies for all bundles
         bundle_deps = []
@@ -211,57 +211,72 @@ class KernelBuilder:
             if all(slot_usage[e] >= SLOT_LIMITS[e] for e in SLOT_LIMITS):
                 continue
             
-            # Try to pull from next few bundles
-            for j in range(i + 1, min(i + 1 + LOOKAHEAD, len(bundles))):
-                if not bundles[j]:
-                    continue
+            # Try to pull from next few bundles - try MULTIPLE times to fill all slots
+            # Keep trying until we can't move anything else
+            moved_something = True
+            while moved_something:
+                moved_something = False
                 
-                # For each engine, try to move ONE instruction at a time
-                for engine in list(bundles[j].keys()):
-                    if slot_usage[engine] >= SLOT_LIMITS[engine]:
+                for j in range(i + 1, min(i + 1 + LOOKAHEAD, len(bundles))):
+                    if not bundles[j]:
                         continue
                     
-                    slots_in_j = bundles[j][engine]
-                    if not slots_in_j:
-                        continue
-                    
-                    # Try first instruction
-                    candidate = slots_in_j[0]
-                    r, w = self._analyze_dependencies(engine, candidate)
-                    
-                    # Check that moving this instruction doesn't violate dependencies
-                    # with bundles i and all intermediate bundles between i and j
-                    safe = True
-                    
-                    # Check bundle i
-                    if (r & bundle_deps[i][1]) or (w & bundle_deps[i][1]) or (w & bundle_deps[i][0]):
-                        safe = False
-                    
-                    # Check intermediate bundles
-                    if safe:
-                        for k in range(i + 1, j):
-                            kr, kw = bundle_deps[k]
-                            if (r & kw) or (w & kr) or (w & kw):
-                                safe = False
+                    # For each engine, try to move as many instructions as possible
+                    for engine in list(bundles[j].keys()):
+                        while slot_usage[engine] < SLOT_LIMITS[engine]:
+                            slots_in_j = bundles[j].get(engine, [])
+                            if not slots_in_j:
                                 break
-                    
-                    if safe:
-                        # Move it
-                        if engine not in bundles[i]:
-                            bundles[i][engine] = []
-                        bundles[i][engine].append(candidate)
-                        
-                        # Remove from bundle j
-                        bundles[j][engine] = slots_in_j[1:]
-                        if not bundles[j][engine]:
-                            del bundles[j][engine]
-                        
-                        # Update dependencies and slot usage
-                        bundle_deps[i] = (
-                            bundle_deps[i][0] | r,
-                            bundle_deps[i][1] | w
-                        )
-                        slot_usage[engine] += 1
+                            
+                            # Try first instruction
+                            candidate = slots_in_j[0]
+                            r, w = self._analyze_dependencies(engine, candidate)
+                            
+                            # Check that moving this instruction doesn't violate dependencies
+                            safe = True
+                            
+                            # Check bundle i
+                            if (r & bundle_deps[i][1]) or (w & bundle_deps[i][1]) or (w & bundle_deps[i][0]):
+                                safe = False
+                            
+                            # Check intermediate bundles
+                            if safe:
+                                for k in range(i + 1, j):
+                                    kr, kw = bundle_deps[k]
+                                    if (r & kw) or (w & kr) or (w & kw):
+                                        safe = False
+                                        break
+                            
+                            if safe:
+                                # Move it
+                                if engine not in bundles[i]:
+                                    bundles[i][engine] = []
+                                bundles[i][engine].append(candidate)
+                                
+                                # Remove from bundle j
+                                bundles[j][engine] = slots_in_j[1:]
+                                if not bundles[j][engine]:
+                                    del bundles[j][engine]
+                                
+                                # Update dependencies and slot usage
+                                bundle_deps[i] = (
+                                    bundle_deps[i][0] | r,
+                                    bundle_deps[i][1] | w
+                                )
+                                slot_usage[engine] += 1
+                                moved_something = True
+                            else:
+                                # Can't move this instruction, try next engine
+                                break
+                
+                # Recalculate slot usage for next iteration
+                slot_usage = {e: 0 for e in SLOT_LIMITS}
+                for engine, slots in bundles[i].items():
+                    slot_usage[engine] = len(slots)
+                
+                # If all slots are full, stop
+                if all(slot_usage[e] >= SLOT_LIMITS[e] for e in SLOT_LIMITS):
+                    break
         
         # Remove empty bundles
         return [b for b in bundles if b]
@@ -373,18 +388,18 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Highly optimized VLIW SIMD kernel with:
+        Ultra-optimized VLIW SIMD kernel with breakthrough optimizations:
         1. SIMD vectorization with VLEN=8 vector operations
-        2. VEC_UNROLL=8 for balanced ILP and scratch space usage
-        3. Address caching to reuse computed addresses
-        4. Hash operation grouping by type within stages
-        5. Pre-allocated constants hoisted outside loops
-        6. Bubble-fill optimization for better bundle packing
-        7. Software pipelined stages for maximum parallelism
+        2. VEC_UNROLL=12 for optimal ILP/scratch balance
+        3. Fused multiply-add operations to reduce operation count
+        4. Software pipelined scalar loads for maximum throughput
+        5. Pre-allocated constants and vectors hoisted outside loops
+        6. Aggressive bubble-fill optimization for better bundle packing
+        7. Interleaved phases to maximize VLIW slot utilization
         """
-        # Unroll factor balancing ILP and scratch space (SCRATCH_SIZE=1536)
-        # 8 provides optimal balance with 4 iterations per round
-        VEC_UNROLL = 8
+        # Optimal unroll factor balancing ILP and bubble-fill effectiveness
+        # 12 provides best overall performance
+        VEC_UNROLL = 12
         
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -512,36 +527,39 @@ class KernelBuilder:
             for vec_base in range(0, n_vec_groups, VEC_UNROLL):
                 n = min(VEC_UNROLL, n_vec_groups - vec_base)
                 
-                # PHASE 1: Compute and cache addresses, then vector load indices
-                # Compute addresses once and cache for later reuse in store phase
+                # PHASE 1: Compute and cache addresses for all vector loads
+                # Batch address computation to maximize ALU slot utilization
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("alu", ("+", vr['indices_addr'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
                     body.append(("alu", ("+", vr['values_addr'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
                 
+                # PHASE 2: Vector load indices and values
+                # Batch loads together to maximize load slot utilization
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("load", ("vload", vr['idx_vec'], vr['indices_addr'])))
-                
-                # PHASE 2: Vector load values using cached addresses
-                for u in range(n):
-                    vr = vregs[u]
                     body.append(("load", ("vload", vr['val_vec'], vr['values_addr'])))
                 
-                # PHASE 3: Scalar indexed loads of node_val (can't vectorize)
-                # Compute all addresses first (allows better ALU packing)
-                for u in range(n):
-                    vr = vregs[u]
-                    for vi in range(VLEN):
-                        sr = scalar_regs[u * VLEN + vi]
-                        body.append(("alu", ("+", sr['addr'], self.scratch["forest_values_p"], vr['idx_vec'] + vi)))
-                
-                # Then do all loads (allows better load packing)
-                for u in range(n):
-                    vr = vregs[u]
-                    for vi in range(VLEN):
-                        sr = scalar_regs[u * VLEN + vi]
-                        body.append(("load", ("load", vr['t1_vec'] + vi, sr['addr'])))
+                # PHASE 3: Scalar indexed loads - interleave in groups for better packing
+                # Process in groups of 4 vectors at a time to allow better overlap
+                GROUP_SIZE = 4
+                for g in range(0, n, GROUP_SIZE):
+                    g_end = min(g + GROUP_SIZE, n)
+                    
+                    # Compute addresses for this group
+                    for u in range(g, g_end):
+                        vr = vregs[u]
+                        for vi in range(VLEN):
+                            sr = scalar_regs[u * VLEN + vi]
+                            body.append(("alu", ("+", sr['addr'], self.scratch["forest_values_p"], vr['idx_vec'] + vi)))
+                    
+                    # Load for this group
+                    for u in range(g, g_end):
+                        vr = vregs[u]
+                        for vi in range(VLEN):
+                            sr = scalar_regs[u * VLEN + vi]
+                            body.append(("load", ("load", vr['t1_vec'] + vi, sr['addr'])))
                 
                 # PHASE 4: Vector XOR - t1_vec now contains nval, XOR with val_vec
                 for u in range(n):
@@ -568,26 +586,22 @@ class KernelBuilder:
                         vr = vregs[u]
                         body.append(("valu", (op2, vr['val_vec'], vr['t1_vec'], vr['t2_vec'])))
                 
-                # PHASE 6: Update indices using optimized formula
+                # PHASE 6: Update indices using optimized bit operations
                 # new_idx = idx*2 + 1 + (val % 2)
-                # This saves one operation compared to the original 5-operation sequence
+                # Optimized: (idx << 1) + 1 + (val & 1)
+                # Use multiply_add to fuse shift and add into multiply and add
                 
-                # Compute val % 2 (0 if even, 1 if odd)
+                # Compute val & 1 (0 if even, 1 if odd) - faster than modulo
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("valu", ("%", vr['t2_vec'], vr['val_vec'], two_vec)))
+                    body.append(("valu", ("&", vr['t2_vec'], vr['val_vec'], one_vec)))
                 
-                # Multiply idx by 2
+                # Fused multiply-add: idx*2 + 1 in one operation
                 for u in range(n):
                     vr = vregs[u]
-                    body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], two_vec)))
+                    body.append(("valu", ("multiply_add", vr['idx_vec'], vr['idx_vec'], two_vec, one_vec)))
                 
-                # Add 1
-                for u in range(n):
-                    vr = vregs[u]
-                    body.append(("valu", ("+", vr['idx_vec'], vr['idx_vec'], one_vec)))
-                
-                # Add (val % 2)
+                # Add (val & 1)
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("valu", ("+", vr['idx_vec'], vr['idx_vec'], vr['t2_vec'])))
