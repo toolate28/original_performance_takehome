@@ -187,7 +187,7 @@ class KernelBuilder:
         if len(bundles) <= 1:
             return bundles
         
-        LOOKAHEAD = 100  # Aggressive lookahead for maximum bubble filling
+        LOOKAHEAD = 200  # Very aggressive lookahead for maximum bubble filling
         
         # Precompute dependencies for all bundles
         bundle_deps = []
