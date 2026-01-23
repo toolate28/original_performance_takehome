@@ -508,9 +508,9 @@ class KernelBuilder:
 
         for round in range(rounds):
             # Round 0 supercollapse optimization: all indices start at 0
-            # Load forest_values[0] once and broadcast to all vectors
+            # Load forest_values[0] once and broadcast to all vectors  
             if round == 0:
-                # Allocate temp for root node value  
+                # Allocate temp for root node value
                 root_node_val = self.alloc_scratch("root_node_val")
                 root_node_addr = self.alloc_scratch("root_node_addr")
                 
