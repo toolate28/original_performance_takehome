@@ -190,7 +190,7 @@ class KernelBuilder:
         if len(bundles) <= 1:
             return bundles
         
-        LOOKAHEAD = 10  # Balanced lookahead for bubble filling
+        LOOKAHEAD = 20  # Optimal: 5156 cycles (10→5337, 20+→5156)
         
         # Precompute dependencies for all bundles
         bundle_deps = []
