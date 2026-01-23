@@ -498,6 +498,7 @@ class KernelBuilder:
 
         body = []
 
+        # Process each round sequentially (software pipelining across rounds not yet implemented)
         for round in range(rounds):
             n_iters = (n_vec_groups + VEC_UNROLL - 1) // VEC_UNROLL
             
@@ -505,15 +506,13 @@ class KernelBuilder:
                 vec_base = iter_idx * VEC_UNROLL
                 n = min(VEC_UNROLL, n_vec_groups - vec_base)
                 
-                # STAGE 1: Load indices
+                # Load indices and values
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("load", ("vload", vr['idx_vec'], vr['addr_base'])))
-                
-                # STAGE 2: Load values
                 for u in range(n):
                     vr = vregs[u]
                     body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
@@ -521,7 +520,7 @@ class KernelBuilder:
                     vr = vregs[u]
                     body.append(("load", ("vload", vr['val_vec'], vr['addr_base'])))
                 
-                # STAGE 3: Indexed loads
+                # Indexed loads
                 for u in range(n):
                     vr = vregs[u]
                     for vi in range(VLEN):
