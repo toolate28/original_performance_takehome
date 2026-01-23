@@ -382,7 +382,7 @@ class KernelBuilder:
         5. Maximum ILP through aggressive bubble filling
         """
         # Optimal unroll factor balancing ILP and scratch usage
-        UNROLL_FACTOR = 12  # Back to best working configuration
+        UNROLL_FACTOR = 12  # Back to working configuration
         ROUND_UNROLL = 2  # Unroll rounds to reduce loop overhead
         
         tmp1 = self.alloc_scratch("tmp1")
@@ -444,12 +444,16 @@ class KernelBuilder:
             vregs.append({
                 'idx_vec': self.alloc_scratch(f"idx_vec{u}", VLEN),
                 'val_vec': self.alloc_scratch(f"val_vec{u}", VLEN),
+                'addr_base': self.alloc_scratch(f"addr_base{u}"),
                 't1_vec': self.alloc_scratch(f"t1_vec{u}", VLEN),
                 't2_vec': self.alloc_scratch(f"t2_vec{u}", VLEN),
                 't3_vec': self.alloc_scratch(f"t3_vec{u}", VLEN),
+                'hash_c1': self.alloc_scratch(f"hash_c1_{u}", VLEN),
+                'hash_c3': self.alloc_scratch(f"hash_c3_{u}", VLEN),
             })
         
         # Allocate scalar registers for the indexed loads (can't vectorize)
+        # We only need addr now since we use load_offset to write directly to vector
         scalar_regs = []
         for s in range(VLEN * UNROLL_FACTOR):
             scalar_regs.append({
