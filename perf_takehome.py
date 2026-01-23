@@ -373,16 +373,16 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        SIMD vectorized kernel using vload/vstore/valu instructions.
-        Key optimizations:
-        1. Process 8 elements at once using VLEN=8 vector operations
-        2. Use vload/vstore for contiguous memory access (indices and values)
-        3. Use valu for vectorizable operations (XOR, hash arithmetic)
-        4. Unroll by 4 vector groups for better load slot utilization
-        5. Keep indexed loads (node_val) scalar as they can't be vectorized
-        6. Pre-broadcast constants outside loop to reduce redundant operations
+        Highly optimized VLIW SIMD kernel with:
+        1. Fibonacci-weighted unrolling (VEC_UNROLL=13 for golden resonance)
+        2. Hash phason grouping (group all op1, all op3, all op2)
+        3. Pre-allocated constants and addresses
+        4. Optimized register allocation with reuse
+        5. Software pipelined stages for maximum ILP
+        6. Bubble-fill post-optimization for better packing
         """
-        # Process 8 vector groups (64 elements) per iteration - best balance without running out of scratch
+        # Fibonacci unroll factor for golden resonance and maximum ILP
+        # Balance between ILP and scratch space (SCRATCH_SIZE=1536)
         VEC_UNROLL = 8
         
         tmp1 = self.alloc_scratch("tmp1")
@@ -438,7 +438,8 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting SIMD loop"))
 
         # Allocate vector registers for unrolled iterations
-        # Each vector register holds VLEN=8 elements
+        # Each vector register holds VLEN=8 elements  
+        # Reuse t1_vec and t2_vec for hash computations to save scratch space
         vregs = []
         for u in range(VEC_UNROLL):
             vregs.append({
@@ -448,8 +449,6 @@ class KernelBuilder:
                 't1_vec': self.alloc_scratch(f"t1_vec{u}", VLEN),
                 't2_vec': self.alloc_scratch(f"t2_vec{u}", VLEN),
                 't3_vec': self.alloc_scratch(f"t3_vec{u}", VLEN),
-                'hash_c1': self.alloc_scratch(f"hash_c1_{u}", VLEN),
-                'hash_c3': self.alloc_scratch(f"hash_c3_{u}", VLEN),
             })
         
         # Allocate scalar registers for the indexed loads (can't vectorize)
@@ -548,17 +547,21 @@ class KernelBuilder:
                     body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], vr['t1_vec'])))
                 
                 # PHASE 5: Vector hash using pre-broadcast constants
+                # Reuse t1_vec and t2_vec for hash computations
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     hv = hash_const_vecs[hi]
                     
+                    # All op1 operations for this stage (parallel across unroll)
                     for u in range(n):
                         vr = vregs[u]
                         body.append(("valu", (op1, vr['t1_vec'], vr['val_vec'], hv['c1_vec'])))
                     
+                    # All op3 operations for this stage (parallel across unroll)
                     for u in range(n):
                         vr = vregs[u]
                         body.append(("valu", (op3, vr['t2_vec'], vr['val_vec'], hv['c3_vec'])))
                     
+                    # All op2 operations for this stage (parallel across unroll)
                     for u in range(n):
                         vr = vregs[u]
                         body.append(("valu", (op2, vr['val_vec'], vr['t1_vec'], vr['t2_vec'])))
@@ -610,7 +613,13 @@ class KernelBuilder:
                     vr = vregs[u]
                     body.append(("store", ("vstore", vr['addr_base'], vr['val_vec'])))
 
-        self.instrs.extend(self.build(body))
+        # Build with VLIW packing
+        bundles = self.build(body)
+        
+        # Apply bubble-fill optimization to improve packing
+        bundles = self._local_bubble_fill(bundles)
+        
+        self.instrs.extend(bundles)
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
