@@ -226,6 +226,27 @@ class RecursiveOptimizer:
                 With perfect overlap, could approach ~1200 cycles theoretical limit
                 """
             ),
+            
+            # PHASE-AWARE OPTIMIZATION
+            OptimizationStrategy(
+                name="Phase-Aware Round 0 Supercollapse",
+                level=OptimizationLevel.VECTORIZATION,
+                expected_speedup=1.024,  # 132 cycles / 5541 cycles
+                dependencies=["SIMD Vectorization"],
+                implementation_complexity='low',
+                preserves_correctness=True,
+                description="""
+                Exploit V=C horizon (100% convergence) in Round 0.
+                - Round 0: All indices = 0 → load forest[0] once + broadcast
+                - Round 1+: Divergent indices → standard indexed loads
+                Binary constraint insight: Round 0 flips all address bits to 0.
+                Implementation: 3-line branch at phase boundary.
+                Cycle reduction: 132 cycles (5541 → 5409)
+                This is the "supercollapse" optimization that recognizes when
+                all memory accesses converge to a single address, allowing us to
+                replace N loads with 1 load + broadcast operation.
+                """
+            ),
         ]
     
     def get_strategy_by_name(self, name: str) -> OptimizationStrategy:
