@@ -184,7 +184,7 @@ class KernelBuilder:
     
     def _local_bubble_fill(self, bundles: list[dict]) -> list[dict]:
         """
-        Conservative local optimization: look ahead a few bundles and try to pull
+        Aggressive local optimization: look ahead more bundles and try to pull
         instructions to fill bubbles while carefully checking ALL dependencies.
         """
         if len(bundles) <= 1:
@@ -204,67 +204,68 @@ class KernelBuilder:
                     writes.update(w)
             bundle_deps.append((reads, writes))
         
-        for i in range(len(bundles)):
-            # Calculate current slot usage
-            slot_usage = {e: 0 for e in SLOT_LIMITS}
-            for engine, slots in bundles[i].items():
-                slot_usage[engine] = len(slots)
-            
-            # Skip if all slots are full
-            if all(slot_usage[e] >= SLOT_LIMITS[e] for e in SLOT_LIMITS):
-                continue
-            
-            # Try to pull from next few bundles
-            for j in range(i + 1, min(i + 1 + LOOKAHEAD, len(bundles))):
-                if not bundles[j]:
+        # Multiple passes for better packing
+        for _ in range(2):  # Two passes to maximize bubble filling
+            for i in range(len(bundles)):
+                # Calculate current slot usage
+                slot_usage = {e: 0 for e in SLOT_LIMITS}
+                for engine, slots in bundles[i].items():
+                    slot_usage[engine] = len(slots)
+                
+                # Skip if all slots are full
+                if all(slot_usage[e] >= SLOT_LIMITS[e] for e in SLOT_LIMITS):
                     continue
                 
-                # For each engine, try to move ONE instruction at a time
-                for engine in list(bundles[j].keys()):
-                    if slot_usage[engine] >= SLOT_LIMITS[engine]:
+                # Try to pull from next few bundles
+                for j in range(i + 1, min(i + 1 + LOOKAHEAD, len(bundles))):
+                    if not bundles[j]:
                         continue
                     
-                    slots_in_j = bundles[j][engine]
-                    if not slots_in_j:
-                        continue
-                    
-                    # Try first instruction
-                    candidate = slots_in_j[0]
-                    r, w = self._analyze_dependencies(engine, candidate)
-                    
-                    # Check that moving this instruction doesn't violate dependencies
-                    # with bundles i and all intermediate bundles between i and j
-                    safe = True
-                    
-                    # Check bundle i
-                    if (r & bundle_deps[i][1]) or (w & bundle_deps[i][1]) or (w & bundle_deps[i][0]):
-                        safe = False
-                    
-                    # Check intermediate bundles
-                    if safe:
-                        for k in range(i + 1, j):
-                            kr, kw = bundle_deps[k]
-                            if (r & kw) or (w & kr) or (w & kw):
-                                safe = False
+                    # For each engine, try to move instructions
+                    for engine in list(bundles[j].keys()):
+                        while slot_usage[engine] < SLOT_LIMITS[engine]:
+                            slots_in_j = bundles[j].get(engine, [])
+                            if not slots_in_j:
                                 break
-                    
-                    if safe:
-                        # Move it
-                        if engine not in bundles[i]:
-                            bundles[i][engine] = []
-                        bundles[i][engine].append(candidate)
-                        
-                        # Remove from bundle j
-                        bundles[j][engine] = slots_in_j[1:]
-                        if not bundles[j][engine]:
-                            del bundles[j][engine]
-                        
-                        # Update dependencies and slot usage
-                        bundle_deps[i] = (
-                            bundle_deps[i][0] | r,
-                            bundle_deps[i][1] | w
-                        )
-                        slot_usage[engine] += 1
+                            
+                            # Try first instruction
+                            candidate = slots_in_j[0]
+                            r, w = self._analyze_dependencies(engine, candidate)
+                            
+                            # Check that moving this instruction doesn't violate dependencies
+                            safe = True
+                            
+                            # Check bundle i
+                            if (r & bundle_deps[i][1]) or (w & bundle_deps[i][1]) or (w & bundle_deps[i][0]):
+                                safe = False
+                            
+                            # Check intermediate bundles
+                            if safe:
+                                for k in range(i + 1, j):
+                                    kr, kw = bundle_deps[k]
+                                    if (r & kw) or (w & kr) or (w & kw):
+                                        safe = False
+                                        break
+                            
+                            if safe:
+                                # Move it
+                                if engine not in bundles[i]:
+                                    bundles[i][engine] = []
+                                bundles[i][engine].append(candidate)
+                                
+                                # Remove from bundle j
+                                bundles[j][engine] = slots_in_j[1:]
+                                if not bundles[j][engine]:
+                                    del bundles[j][engine]
+                                
+                                # Update dependencies and slot usage
+                                bundle_deps[i] = (
+                                    bundle_deps[i][0] | r,
+                                    bundle_deps[i][1] | w
+                                )
+                                slot_usage[engine] += 1
+                            else:
+                                break  # Can't move this one, stop trying this engine
         
         # Remove empty bundles
         return [b for b in bundles if b]
@@ -376,7 +377,7 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        SIMD vectorized kernel using vload/vstore/valu instructions.
+        Highly optimized SIMD vectorized kernel.
         Key optimizations:
         1. Process 8 elements at once using VLEN=8 vector operations
         2. Use vload/vstore for contiguous memory access (indices and values)
@@ -442,7 +443,6 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting SIMD loop"))
 
         # Allocate vector registers for unrolled iterations
-        # Each vector register holds VLEN=8 elements
         vregs = []
         for u in range(VEC_UNROLL):
             vregs.append({
@@ -454,19 +454,15 @@ class KernelBuilder:
                 't3_vec': self.alloc_scratch(f"t3_vec{u}", VLEN),
             })
         
-        # Allocate scalar registers for the indexed loads (can't vectorize)
-        # We only need addr now since we use load_offset to write directly to vector
-        scalar_regs = []
-        for s in range(VLEN * VEC_UNROLL):
-            scalar_regs.append({
-                'addr': self.alloc_scratch(f"s_addr{s}"),
-            })
+        # Key optimization: Reuse scalar address registers
+        scalar_addr_pool = []
+        for s in range(VLEN):
+            scalar_addr_pool.append(self.alloc_scratch(f"s_addr{s}"))
         
         # Number of vector groups = batch_size / VLEN
         n_vec_groups = batch_size // VLEN
         
         # Pre-allocate and broadcast common constants outside the loop
-        # This avoids redundant broadcasts in each iteration
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
         two_vec = self.alloc_scratch("two_vec", VLEN)
         n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
@@ -688,7 +684,10 @@ class KernelBuilder:
                         vr = vregs[u]
                         body.append(("store", ("vstore", vr['addr_base'], vr['val_vec'])))
 
-        self.instrs.extend(self.build(body))
+        body_instrs = self.build(body)
+        # Apply bubble fill optimization
+        body_instrs = self._local_bubble_fill(body_instrs)
+        self.instrs.extend(body_instrs)
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
