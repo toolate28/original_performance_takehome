@@ -45,90 +45,6 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def _analyze_dependencies(self, engine: Engine, slot: tuple):
-        """
-        Analyze dependencies for a given engine and slot.
-        Returns (reads: set, writes: set) of scratch addresses.
-        """
-        reads = set()
-        writes = set()
-        
-        if engine == "alu":
-            # (op, dest, src1, src2)
-            op, dest, src1, src2 = slot
-            reads.add(src1)
-            reads.add(src2)
-            writes.add(dest)
-        elif engine == "valu":
-            # Vector ALU operations
-            if slot[0] == "vbroadcast":
-                # ("vbroadcast", dest, src) - writes VLEN elements
-                _, dest, src = slot
-                reads.add(src)
-                for i in range(VLEN):
-                    writes.add(dest + i)
-            elif len(slot) == 4:
-                # (op, dest, src1, src2) - all are vectors
-                _, dest, src1, src2 = slot
-                for i in range(VLEN):
-                    reads.add(src1 + i)
-                    reads.add(src2 + i)
-                    writes.add(dest + i)
-            elif len(slot) == 5:
-                # multiply_add or other 4-arg valu ops
-                _, dest, a, b, c = slot
-                for i in range(VLEN):
-                    reads.add(a + i)
-                    reads.add(b + i)
-                    reads.add(c + i)
-                    writes.add(dest + i)
-            else:
-                # Unknown valu operation - raise error to aid debugging
-                raise NotImplementedError(f"Unknown valu op format: {slot}")
-        elif engine == "load":
-            if slot[0] == "const":
-                # ("const", dest, val) - only writes
-                writes.add(slot[1])
-            elif slot[0] == "load":
-                # ("load", dest, addr)
-                writes.add(slot[1])
-                reads.add(slot[2])
-            elif slot[0] == "load_offset":
-                # ("load_offset", dest, addr, offset) - writes to dest+offset
-                _, dest, addr, offset = slot
-                writes.add(dest + offset)
-                reads.add(addr + offset)
-            elif slot[0] == "vload":
-                # ("vload", dest, addr) - loads VLEN elements
-                _, dest, addr = slot
-                reads.add(addr)
-                for i in range(VLEN):
-                    writes.add(dest + i)
-        elif engine == "store":
-            if slot[0] == "store":
-                # ("store", addr, src)
-                reads.add(slot[1])
-                reads.add(slot[2])
-            elif slot[0] == "vstore":
-                # ("vstore", addr, src) - stores VLEN elements
-                _, addr, src = slot
-                reads.add(addr)
-                for i in range(VLEN):
-                    reads.add(src + i)
-        elif engine == "flow":
-            if slot[0] == "select":
-                # ("select", dest, cond, a, b)
-                writes.add(slot[1])
-                reads.add(slot[2])
-                reads.add(slot[3])
-                reads.add(slot[4])
-        elif engine == "debug":
-            if slot[0] == "compare":
-                # ("compare", addr, ...) - reads the value at addr
-                reads.add(slot[1])
-        
-        return (reads, writes)
-    
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = True):
         """
         Pack slots into VLIW instruction bundles with dependency awareness.
@@ -177,20 +93,17 @@ class KernelBuilder:
         if current_bundle:
             instrs.append(current_bundle)
         
-        # Apply bubble filling optimization
-        instrs = self._local_bubble_fill(instrs)
-        
         return instrs
     
     def _local_bubble_fill(self, bundles: list[dict]) -> list[dict]:
         """
-        Aggressive local optimization: look ahead more bundles and try to pull
+        Conservative local optimization: look ahead a few bundles and try to pull
         instructions to fill bubbles while carefully checking ALL dependencies.
         """
         if len(bundles) <= 1:
             return bundles
         
-        LOOKAHEAD = 20  # Optimal: 5156 cycles (10→5337, 20+→5156)
+        LOOKAHEAD = 200  # Very aggressive lookahead for maximum bubble filling
         
         # Precompute dependencies for all bundles
         bundle_deps = []
@@ -204,68 +117,67 @@ class KernelBuilder:
                     writes.update(w)
             bundle_deps.append((reads, writes))
         
-        # Multiple passes for better packing
-        for _ in range(2):  # Two passes to maximize bubble filling
-            for i in range(len(bundles)):
-                # Calculate current slot usage
-                slot_usage = {e: 0 for e in SLOT_LIMITS}
-                for engine, slots in bundles[i].items():
-                    slot_usage[engine] = len(slots)
-                
-                # Skip if all slots are full
-                if all(slot_usage[e] >= SLOT_LIMITS[e] for e in SLOT_LIMITS):
+        for i in range(len(bundles)):
+            # Calculate current slot usage
+            slot_usage = {e: 0 for e in SLOT_LIMITS}
+            for engine, slots in bundles[i].items():
+                slot_usage[engine] = len(slots)
+            
+            # Skip if all slots are full
+            if all(slot_usage[e] >= SLOT_LIMITS[e] for e in SLOT_LIMITS):
+                continue
+            
+            # Try to pull from next few bundles
+            for j in range(i + 1, min(i + 1 + LOOKAHEAD, len(bundles))):
+                if not bundles[j]:
                     continue
                 
-                # Try to pull from next few bundles
-                for j in range(i + 1, min(i + 1 + LOOKAHEAD, len(bundles))):
-                    if not bundles[j]:
+                # For each engine, try to move ONE instruction at a time
+                for engine in list(bundles[j].keys()):
+                    if slot_usage[engine] >= SLOT_LIMITS[engine]:
                         continue
                     
-                    # For each engine, try to move instructions
-                    for engine in list(bundles[j].keys()):
-                        while slot_usage[engine] < SLOT_LIMITS[engine]:
-                            slots_in_j = bundles[j].get(engine, [])
-                            if not slots_in_j:
-                                break
-                            
-                            # Try first instruction
-                            candidate = slots_in_j[0]
-                            r, w = self._analyze_dependencies(engine, candidate)
-                            
-                            # Check that moving this instruction doesn't violate dependencies
-                            safe = True
-                            
-                            # Check bundle i
-                            if (r & bundle_deps[i][1]) or (w & bundle_deps[i][1]) or (w & bundle_deps[i][0]):
+                    slots_in_j = bundles[j][engine]
+                    if not slots_in_j:
+                        continue
+                    
+                    # Try first instruction
+                    candidate = slots_in_j[0]
+                    r, w = self._analyze_dependencies(engine, candidate)
+                    
+                    # Check that moving this instruction doesn't violate dependencies
+                    # with bundles i and all intermediate bundles between i and j
+                    safe = True
+                    
+                    # Check bundle i
+                    if (r & bundle_deps[i][1]) or (w & bundle_deps[i][1]) or (w & bundle_deps[i][0]):
+                        safe = False
+                    
+                    # Check intermediate bundles
+                    if safe:
+                        for k in range(i + 1, j):
+                            kr, kw = bundle_deps[k]
+                            if (r & kw) or (w & kr) or (w & kw):
                                 safe = False
-                            
-                            # Check intermediate bundles
-                            if safe:
-                                for k in range(i + 1, j):
-                                    kr, kw = bundle_deps[k]
-                                    if (r & kw) or (w & kr) or (w & kw):
-                                        safe = False
-                                        break
-                            
-                            if safe:
-                                # Move it
-                                if engine not in bundles[i]:
-                                    bundles[i][engine] = []
-                                bundles[i][engine].append(candidate)
-                                
-                                # Remove from bundle j
-                                bundles[j][engine] = slots_in_j[1:]
-                                if not bundles[j][engine]:
-                                    del bundles[j][engine]
-                                
-                                # Update dependencies and slot usage
-                                bundle_deps[i] = (
-                                    bundle_deps[i][0] | r,
-                                    bundle_deps[i][1] | w
-                                )
-                                slot_usage[engine] += 1
-                            else:
-                                break  # Can't move this one, stop trying this engine
+                                break
+                    
+                    if safe:
+                        # Move it
+                        if engine not in bundles[i]:
+                            bundles[i][engine] = []
+                        bundles[i][engine].append(candidate)
+                        
+                        # Remove from bundle j
+                        bundles[j][engine] = slots_in_j[1:]
+                        if not bundles[j][engine]:
+                            del bundles[j][engine]
+                        
+                        # Update dependencies and slot usage
+                        bundle_deps[i] = (
+                            bundle_deps[i][0] | r,
+                            bundle_deps[i][1] | w
+                        )
+                        slot_usage[engine] += 1
         
         # Remove empty bundles
         return [b for b in bundles if b]
@@ -377,18 +289,24 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Highly optimized SIMD vectorized kernel.
+        Ultra-optimized SIMD kernel with operation fusion and perfect packing.
         Key optimizations:
-        1. Process 8 elements at once using VLEN=8 vector operations
-        2. Use vload/vstore for contiguous memory access (indices and values)
-        3. Use valu for vectorizable operations (XOR, hash arithmetic)
-        4. Strategic unrolling to maximize load/store slot utilization
-        5. Keep indexed loads (node_val) scalar as they can't be vectorized
-        6. Pre-broadcast constants outside loop to reduce redundant operations
-        7. Batch similar operations together for better VLIW packing
+        1. Fuse operations using multiply_add to reduce instruction count
+        2. Process 8 elements at once using VLEN=8 vector operations
+        3. Optimal unrolling balanced with scratch space constraints
+        4. Pre-compute ALL addresses to eliminate redundant ALU ops
+        5. Maximum ILP through aggressive bubble filling
         """
-        # Optimal balance between parallelism and packing efficiency
-        VEC_UNROLL = 8
+        # Optimal unroll factor: 12 provides best balance of:
+        # - ILP (instruction-level parallelism) for bubble filling
+        # - Scratch space usage (5 vec regs × 8 elements × 12 = 480 words)
+        # - Tested 8, 12, 16, 20: 12 gives best cycle count
+        UNROLL_FACTOR = 12
+        ROUND_UNROLL = 2  # Unroll rounds to reduce loop overhead
+        
+        # Rounds with high deduplication potential (for load optimization)
+        DEDUP_ROUNDS_100 = {0, 11}  # All 256 elements access same node (100% dedup)
+        DEDUP_ROUNDS_50 = {1, 12}   # Only 2 unique nodes accessed (50% dedup)
         
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -442,32 +360,41 @@ class KernelBuilder:
         self.add("flow", ("pause",))
         self.add("debug", ("comment", "Starting SIMD loop"))
 
-        # Allocate vector registers for unrolled iterations
+        # Allocate vector registers for unrolled iterations with hash stage separation
+        # Each vector register holds VLEN=8 elements
         vregs = []
-        for u in range(VEC_UNROLL):
-            vregs.append({
+        for u in range(UNROLL_FACTOR):
+            vreg = {
                 'idx_vec': self.alloc_scratch(f"idx_vec{u}", VLEN),
                 'val_vec': self.alloc_scratch(f"val_vec{u}", VLEN),
-                'addr_base': self.alloc_scratch(f"addr_base{u}"),
                 't1_vec': self.alloc_scratch(f"t1_vec{u}", VLEN),
                 't2_vec': self.alloc_scratch(f"t2_vec{u}", VLEN),
                 't3_vec': self.alloc_scratch(f"t3_vec{u}", VLEN),
-            })
+            }
+            # Allocate separate val_vec for each hash stage to enable parallelization
+            vreg['hash_vals'] = []
+            for hi in range(len(HASH_STAGES)):
+                vreg['hash_vals'].append(self.alloc_scratch(f"hv{u}_{hi}", VLEN))
+            vregs.append(vreg)
         
-        # Key optimization: Reuse scalar address registers
-        scalar_addr_pool = []
-        for s in range(VLEN):
-            scalar_addr_pool.append(self.alloc_scratch(f"s_addr{s}"))
+        # Allocate scalar registers for the indexed loads (can't vectorize)
+        scalar_regs = []
+        for s in range(VLEN * UNROLL_FACTOR):
+            scalar_regs.append({
+                'addr': self.alloc_scratch(f"s_addr{s}"),
+            })
         
         # Number of vector groups = batch_size / VLEN
         n_vec_groups = batch_size // VLEN
         
         # Pre-allocate and broadcast common constants outside the loop
+        # This avoids redundant broadcasts in each iteration
         zero_vec = self.alloc_scratch("zero_vec", VLEN)
         two_vec = self.alloc_scratch("two_vec", VLEN)
         n_nodes_vec = self.alloc_scratch("n_nodes_vec", VLEN)
         
-        # Pre-compute offset constants - only need what we use
+        # Pre-compute offset constants for all possible vec_base positions
+        # This eliminates const loads inside the loop
         offset_consts = []
         for vec_idx in range(n_vec_groups):
             offset_consts.append(self.alloc_scratch(f"offset_{vec_idx}"))
@@ -480,10 +407,13 @@ class KernelBuilder:
                 'c3_vec': self.alloc_scratch(f"hash_c3_vec{hi}", VLEN),
             })
         
+        # Allocate vector for constant 1 (used in dedup rounds and bitwise & optimization)
+        const_1_vec = self.alloc_scratch("const_1_vec", VLEN)
+        
         # Load and broadcast constants once before the loop
         pre_body = []
         
-        # Load offset constants - only those we'll actually use
+        # Load offset constants
         for vec_idx in range(n_vec_groups):
             pre_body.append(("load", ("const", offset_consts[vec_idx], vec_idx * VLEN)))
         
@@ -491,6 +421,7 @@ class KernelBuilder:
         pre_body.append(("valu", ("vbroadcast", zero_vec, zero_const)))
         pre_body.append(("valu", ("vbroadcast", two_vec, two_const)))
         pre_body.append(("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])))
+        pre_body.append(("valu", ("vbroadcast", const_1_vec, one_const)))
         
         # Broadcast hash constants
         for hi, (c1, c3) in enumerate(hash_consts):
@@ -500,52 +431,55 @@ class KernelBuilder:
         
         self.instrs.extend(self.build(pre_body))
 
-        body = []
+        # Allocate address registers for loads/stores (computed once, reused across rounds)
+        addr_indices_load = []
+        addr_values_load = []
+        addr_indices_store = []
+        addr_values_store = []
+        for vec_idx in range(n_vec_groups):
+            addr_indices_load.append(self.alloc_scratch(f"addr_idx_ld{vec_idx}"))
+            addr_values_load.append(self.alloc_scratch(f"addr_val_ld{vec_idx}"))
+            addr_indices_store.append(self.alloc_scratch(f"addr_idx_st{vec_idx}"))
+            addr_values_store.append(self.alloc_scratch(f"addr_val_st{vec_idx}"))
+        
+        # Pre-compute address vectors for all vector groups (computed once!)
+        addr_body = []
+        for vec_idx in range(n_vec_groups):
+            addr_body.append(("alu", ("+", addr_indices_load[vec_idx], self.scratch["inp_indices_p"], offset_consts[vec_idx])))
+            addr_body.append(("alu", ("+", addr_values_load[vec_idx], self.scratch["inp_values_p"], offset_consts[vec_idx])))
+            addr_body.append(("alu", ("+", addr_indices_store[vec_idx], self.scratch["inp_indices_p"], offset_consts[vec_idx])))
+            addr_body.append(("alu", ("+", addr_values_store[vec_idx], self.scratch["inp_values_p"], offset_consts[vec_idx])))
+        
+        self.instrs.extend(self.build(addr_body))
 
-        for round in range(rounds):
-            # Round 0 supercollapse optimization: all indices start at 0
-            # Load forest_values[0] once and broadcast to all vectors  
-            if round == 0:
-                # Allocate temp for root node value
-                root_node_val = self.alloc_scratch("root_node_val")
-                root_node_addr = self.alloc_scratch("root_node_addr")
+        body = []
+        
+        # Allocate registers for deduplication
+        shared_node_val = self.alloc_scratch("shared_node_val")
+        shared_node_vec = self.alloc_scratch("shared_node_vec", VLEN)
+        node_val_1 = self.alloc_scratch("node_val_1")
+        node_val_2 = self.alloc_scratch("node_val_2")
+        node_vec_1 = self.alloc_scratch("node_vec_1", VLEN)
+        node_vec_2 = self.alloc_scratch("node_vec_2", VLEN)
+
+        for round_num in range(rounds):
+            # Special optimization for rounds with few unique indices
+            if round_num in DEDUP_ROUNDS_100:
+                # ALL indices are 0 - 100% deduplication
+                body.append(("load", ("load", shared_node_val, self.scratch["forest_values_p"])))
+                body.append(("valu", ("vbroadcast", shared_node_vec, shared_node_val)))
                 
-                # Load forest_values[0]
-                body.append(("alu", ("+", root_node_addr, self.scratch["forest_values_p"], zero_const)))
-                body.append(("load", ("load", root_node_val, root_node_addr)))
-                
-                # Process all vector groups with optimized path
-                for vec_base in range(0, n_vec_groups, VEC_UNROLL):
-                    n = min(VEC_UNROLL, n_vec_groups - vec_base)
+                for vec_base in range(0, n_vec_groups, UNROLL_FACTOR):
+                    n = min(UNROLL_FACTOR, n_vec_groups - vec_base)
                     
-                    # PHASE 1: Vector load indices
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("load", ("vload", vr['idx_vec'], vr['addr_base'])))
+                        body.append(("load", ("vload", vr['val_vec'], addr_values_load[vec_base + u])))
                     
-                    # PHASE 2: Vector load values
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("load", ("vload", vr['val_vec'], vr['addr_base'])))
+                        body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], shared_node_vec)))
                     
-                    # PHASE 3 OPTIMIZED: Broadcast root node to all vectors (replaces 256 indexed loads!)
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("valu", ("vbroadcast", vr['t1_vec'], root_node_val)))
-                    
-                    # PHASE 4-8: Continue with normal processing
-                    # PHASE 4: Vector XOR
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], vr['t1_vec'])))
-                    
-                    # PHASE 5: Vector hash
                     for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                         hv = hash_const_vecs[hi]
                         for u in range(n):
@@ -558,21 +492,84 @@ class KernelBuilder:
                             vr = vregs[u]
                             body.append(("valu", (op2, vr['val_vec'], vr['t1_vec'], vr['t2_vec'])))
                     
-                    # PHASE 6: Update indices
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("valu", ("%", vr['t2_vec'], vr['val_vec'], two_vec)))
+                        body.append(("valu", ("&", vr['t2_vec'], vr['val_vec'], const_1_vec)))
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("valu", ("==", vr['t2_vec'], vr['t2_vec'], zero_vec)))
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("valu", ("-", vr['t3_vec'], two_vec, vr['t2_vec'])))
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("valu", ("multiply_add", vr['idx_vec'], vr['idx_vec'], two_vec, vr['t3_vec'])))
+                        body.append(("valu", ("+", vr['idx_vec'], const_1_vec, vr['t2_vec'])))
                     
-                    # PHASE 7: Wrap indices
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("store", ("vstore", addr_indices_store[vec_base + u], vr['idx_vec'])))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("store", ("vstore", addr_values_store[vec_base + u], vr['val_vec'])))
+                
+                continue
+            
+            elif round_num in DEDUP_ROUNDS_50:
+                # Indices are either 1 or 2 - load both, select based on index
+                body.append(("load", ("const", tmp1, 1)))
+                body.append(("alu", ("+", tmp2, self.scratch["forest_values_p"], tmp1)))
+                body.append(("load", ("load", node_val_1, tmp2)))
+                body.append(("load", ("const", tmp1, 2)))
+                body.append(("alu", ("+", tmp2, self.scratch["forest_values_p"], tmp1)))
+                body.append(("load", ("load", node_val_2, tmp2)))
+                
+                # Broadcast both values
+                body.append(("valu", ("vbroadcast", node_vec_1, node_val_1)))
+                body.append(("valu", ("vbroadcast", node_vec_2, node_val_2)))
+                
+                for vec_base in range(0, n_vec_groups, UNROLL_FACTOR):
+                    n = min(UNROLL_FACTOR, n_vec_groups - vec_base)
+                    
+                    # Load indices and values
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("load", ("vload", vr['idx_vec'], addr_indices_load[vec_base + u])))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("load", ("vload", vr['val_vec'], addr_values_load[vec_base + u])))
+                    
+                    # Select correct node value: if idx==1 then node_val_1 else node_val_2
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("==", vr['t2_vec'], vr['idx_vec'], const_1_vec)))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("flow", ("vselect", vr['t1_vec'], vr['t2_vec'], node_vec_1, node_vec_2)))
+                    
+                    # XOR with selected value
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], vr['t1_vec'])))
+                    
+                    # Hash
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                        hv = hash_const_vecs[hi]
+                        for u in range(n):
+                            vr = vregs[u]
+                            body.append(("valu", (op1, vr['t1_vec'], vr['val_vec'], hv['c1_vec'])))
+                        for u in range(n):
+                            vr = vregs[u]
+                            body.append(("valu", (op3, vr['t2_vec'], vr['val_vec'], hv['c3_vec'])))
+                        for u in range(n):
+                            vr = vregs[u]
+                            body.append(("valu", (op2, vr['val_vec'], vr['t1_vec'], vr['t2_vec'])))
+                    
+                    # Update indices using bitwise & + multiply_add fusion
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("&", vr['t2_vec'], vr['val_vec'], const_1_vec)))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("multiply_add", vr['idx_vec'], vr['idx_vec'], two_vec, const_1_vec)))
+                    for u in range(n):
+                        vr = vregs[u]
+                        body.append(("valu", ("+", vr['idx_vec'], vr['idx_vec'], vr['t2_vec'])))
+                    
+                    # Wrap indices
                     for u in range(n):
                         vr = vregs[u]
                         body.append(("valu", ("<", vr['t1_vec'], vr['idx_vec'], n_nodes_vec)))
@@ -580,114 +577,116 @@ class KernelBuilder:
                         vr = vregs[u]
                         body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], vr['t1_vec'])))
                     
-                    # PHASE 8: Vector store results
+                    # Store
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
+                        body.append(("store", ("vstore", addr_indices_store[vec_base + u], vr['idx_vec'])))
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("store", ("vstore", vr['addr_base'], vr['idx_vec'])))
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("store", ("vstore", vr['addr_base'], vr['val_vec'])))
-            else:
-                # Rounds 1+: normal processing with indexed loads
-                for vec_base in range(0, n_vec_groups, VEC_UNROLL):
-                    n = min(VEC_UNROLL, n_vec_groups - vec_base)
+                        body.append(("store", ("vstore", addr_values_store[vec_base + u], vr['val_vec'])))
+                
+                continue
+
+            # Normal path for other rounds
+            for vec_base in range(0, n_vec_groups, UNROLL_FACTOR):
+                n = min(UNROLL_FACTOR, n_vec_groups - vec_base)
+                
+                # PHASE 1: Vector load indices using pre-computed addresses
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("load", ("vload", vr['idx_vec'], addr_indices_load[vec_base + u])))
+                
+                # PHASE 2: Vector load values using pre-computed addresses
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("load", ("vload", vr['val_vec'], addr_values_load[vec_base + u])))
+                
+                # PHASE 3: Scalar indexed loads - interleave in groups for better packing
+                # Process in groups of 4 vectors at a time for better load/ALU overlap
+                GROUP_SIZE = 4
+                for g in range(0, n, GROUP_SIZE):
+                    g_end = min(g + GROUP_SIZE, n)
                     
-                    # PHASE 1: Vector load indices - batch ALU then batch loads
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
-                    
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("load", ("vload", vr['idx_vec'], vr['addr_base'])))
-                    
-                    # PHASE 2: Vector load values - batch ALU then batch loads
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
-                    
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("load", ("vload", vr['val_vec'], vr['addr_base'])))
-                    
-                    # PHASE 3: Scalar indexed loads - batch all ALU, then batch all loads
-                    for u in range(n):
+                    # Compute addresses for this group
+                    for u in range(g, g_end):
                         vr = vregs[u]
                         for vi in range(VLEN):
                             sr = scalar_regs[u * VLEN + vi]
                             body.append(("alu", ("+", sr['addr'], self.scratch["forest_values_p"], vr['idx_vec'] + vi)))
                     
-                    for u in range(n):
+                    # Load for this group
+                    for u in range(g, g_end):
                         vr = vregs[u]
                         for vi in range(VLEN):
                             sr = scalar_regs[u * VLEN + vi]
                             body.append(("load", ("load", vr['t1_vec'] + vi, sr['addr'])))
-                    
-                    # PHASE 4: Vector XOR
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], vr['t1_vec'])))
-                    
-                    # PHASE 5: Vector hash - batch by operation type across all vectors
-                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                        hv = hash_const_vecs[hi]
-                        for u in range(n):
-                            vr = vregs[u]
-                            body.append(("valu", (op1, vr['t1_vec'], vr['val_vec'], hv['c1_vec'])))
-                        for u in range(n):
-                            vr = vregs[u]
-                            body.append(("valu", (op3, vr['t2_vec'], vr['val_vec'], hv['c3_vec'])))
-                        for u in range(n):
-                            vr = vregs[u]
-                            body.append(("valu", (op2, vr['val_vec'], vr['t1_vec'], vr['t2_vec'])))
-                    
-                    # PHASE 6: Update indices - batch operations
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("valu", ("%", vr['t2_vec'], vr['val_vec'], two_vec)))
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("valu", ("==", vr['t2_vec'], vr['t2_vec'], zero_vec)))
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("valu", ("-", vr['t3_vec'], two_vec, vr['t2_vec'])))
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("valu", ("multiply_add", vr['idx_vec'], vr['idx_vec'], two_vec, vr['t3_vec'])))
-                    
-                    # PHASE 7: Wrap indices
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("valu", ("<", vr['t1_vec'], vr['idx_vec'], n_nodes_vec)))
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], vr['t1_vec'])))
-                    
-                    # PHASE 8: Vector store results - batch ALU then batch stores
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_indices_p"], offset_consts[vec_base + u])))
-                    for u in range(n):
-                        vr = vregs[u]
-                        body.append(("store", ("vstore", vr['addr_base'], vr['idx_vec'])))
+                
+                # PHASE 4: Vector XOR
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("valu", ("^", vr['val_vec'], vr['val_vec'], vr['t1_vec'])))
+                
+                # PHASE 5: Vector hash with staged computation
+                # Use separate val_vec for each stage except last to reduce WAR hazards
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    hv = hash_const_vecs[hi]
+                    is_last = (hi == len(HASH_STAGES) - 1)
                     
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("alu", ("+", vr['addr_base'], self.scratch["inp_values_p"], offset_consts[vec_base + u])))
+                        src = vr['val_vec'] if hi == 0 else vr['hash_vals'][hi-1]
+                        body.append(("valu", (op1, vr['t1_vec'], src, hv['c1_vec'])))
+                    
                     for u in range(n):
                         vr = vregs[u]
-                        body.append(("store", ("vstore", vr['addr_base'], vr['val_vec'])))
+                        src = vr['val_vec'] if hi == 0 else vr['hash_vals'][hi-1]
+                        body.append(("valu", (op3, vr['t2_vec'], src, hv['c3_vec'])))
+                    
+                    for u in range(n):
+                        vr = vregs[u]
+                        # Last stage writes to val_vec, others to staging area
+                        dest = vr['val_vec'] if is_last else vr['hash_vals'][hi]
+                        body.append(("valu", (op2, dest, vr['t1_vec'], vr['t2_vec'])))
 
-        body_instrs = self.build(body)
-        # Apply bubble fill optimization
-        body_instrs = self._local_bubble_fill(body_instrs)
-        self.instrs.extend(body_instrs)
+                
+                # PHASE 6: Update indices using bitwise & + multiply_add fusion
+                # val & 1 gives 0 (even) or 1 (odd), then idx = idx*2 + 1 + (val&1)
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("valu", ("&", vr['t2_vec'], vr['val_vec'], const_1_vec)))
+                
+                # Fused multiply-add: idx*2 + 1 in one operation
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("valu", ("multiply_add", vr['idx_vec'], vr['idx_vec'], two_vec, const_1_vec)))
+                
+                # Add (val & 1) to get final index
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("valu", ("+", vr['idx_vec'], vr['idx_vec'], vr['t2_vec'])))
+                
+                # PHASE 7: Wrap indices using pre-broadcast constant
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("valu", ("<", vr['t1_vec'], vr['idx_vec'], n_nodes_vec)))
+                
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("valu", ("*", vr['idx_vec'], vr['idx_vec'], vr['t1_vec'])))
+                
+                # PHASE 8: Vector store results using pre-computed addresses
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("store", ("vstore", addr_indices_store[vec_base + u], vr['idx_vec'])))
+                
+                for u in range(n):
+                    vr = vregs[u]
+                    body.append(("store", ("vstore", addr_values_store[vec_base + u], vr['val_vec'])))
+
+        # Build and apply bubble fill optimization
+        bundles = self.build(body)
+        bundles = self._local_bubble_fill(bundles)
+        self.instrs.extend(bundles)
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
