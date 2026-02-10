@@ -508,7 +508,7 @@ class KernelBuilder:
                 
                 continue
             
-            elif round_num == 1 or round_num == 12:
+            elif round_num in DEDUP_ROUNDS_50:
                 # Indices are either 1 or 2 - load both, select based on index
                 body.append(("load", ("const", tmp1, 1)))
                 body.append(("alu", ("+", tmp2, self.scratch["forest_values_p"], tmp1)))
